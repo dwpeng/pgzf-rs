@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 readme = "README.md"
 repository = "https://github.com/dwpeng/pgzf-rs"
+license = "MIT"
+description = "A Rust library for working with the PGZF file format."
 
 [dependencies]
 flate2 = { version = "1.1.9", features = ["zlib-rs"], default-features = false }
