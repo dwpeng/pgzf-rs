@@ -1,10 +1,10 @@
 use std::{
     fs::File,
     io::{self, Read, Seek, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
-use clap::{Parser, Subcommand};
+use clap::Parser;
 
 #[derive(Parser)]
 #[command(
@@ -12,73 +12,74 @@ use clap::{Parser, Subcommand};
     about = "Parallel GZip Format compression/decompression"
 )]
 struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
+    /// Decompress
+    #[arg(short = 'd')]
+    decompress: bool,
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Compress input to PGZF format
-    Compress {
-        /// Input file (default: stdin)
-        #[arg(short, long)]
-        input: Option<PathBuf>,
+    /// Write to stdout, keep original files
+    #[arg(short = 'c')]
+    stdout: bool,
 
-        /// Output file (default: stdout)
-        #[arg(short, long)]
-        output: Option<PathBuf>,
+    /// Keep input files
+    #[arg(short = 'k', short_alias = 'K')]
+    keep: bool,
 
-        /// Block size in MB (1-256, default: 1)
-        #[arg(short = 'b', long, default_value_t = 1)]
-        block_size_mb: usize,
+    /// Force overwrite
+    #[arg(short = 'f')]
+    force: bool,
 
-        /// Number of blocks per group
-        #[arg(short = 'g', long, default_value_t = 8000)]
-        group_blocks: usize,
+    /// Output file
+    #[arg(short = 'o')]
+    output: Option<PathBuf>,
 
-        /// Compression level (1-9, default: 6)
-        #[arg(short = 'l', long, default_value_t = 6)]
-        level: u32,
+    /// Number of threads
+    #[arg(short = 't', default_value_t = 8)]
+    threads: usize,
 
-        /// Number of threads for parallel compression
-        #[arg(short = 't', long, default_value_t = 8)]
-        threads: usize,
-    },
+    /// Block size in MB (1-256)
+    #[arg(short = 'b', default_value_t = 1)]
+    block_size_mb: usize,
 
-    /// Decompress PGZF or gzip input
-    Decompress {
-        /// Input file (default: stdin)
-        #[arg(short, long)]
-        input: Option<PathBuf>,
+    /// Number of blocks per group
+    #[arg(short = 'g', default_value_t = 8000)]
+    group_blocks: usize,
 
-        /// Output file (default: stdout)
-        #[arg(short, long)]
-        output: Option<PathBuf>,
+    /// Seek to byte offset (decompress only)
+    #[arg(short = 's')]
+    seek_byte: Option<u64>,
 
-        /// Seek to byte offset before decompressing
-        #[arg(short = 'p', long)]
-        seek_byte: Option<u64>,
+    /// Limit output bytes (decompress only)
+    #[arg(short = 'q')]
+    limit: Option<u64>,
 
-        /// Limit output to N bytes
-        #[arg(short = 'q', long)]
-        limit: Option<u64>,
+    /// Compression level (1-9)
+    #[arg(short = 'l', default_value_t = 6)]
+    level: u32,
 
-        /// Number of threads for parallel decompression
-        #[arg(short = 't', long, default_value_t = 8)]
-        threads: usize,
-    },
+    /// Input files
+    #[arg(value_name = "FILE")]
+    files: Vec<PathBuf>,
 
-    /// Inspect PGZF file structure and index
-    Inspect {
-        /// Input PGZF file
-        input: PathBuf,
-    },
+    /// Inspect compressed file info
+    #[arg(short = 'i')]
+    inspect: bool,
 }
 
 fn init_rayon_pool(threads: usize) {
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build_global();
+}
+
+fn gz_extension(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".gz");
+    PathBuf::from(s)
+}
+
+fn strip_gz_extension(path: &Path) -> Option<PathBuf> {
+    let s = path.to_str()?;
+    s.strip_suffix(".gz").map(PathBuf::from)
 }
 
 fn decompress_stream<R: Read + Seek>(
@@ -114,80 +115,132 @@ fn decompress_stream<R: Read + Seek>(
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+fn compress_file(
+    input: &Path,
+    output: &Path,
+    config: pgzf::PgzfConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut reader = File::open(input)?;
+    let writer = File::create(output)?;
+    let mut pgzf_writer = pgzf::PgzfWriter::with_config(writer, config);
+    io::copy(&mut reader, &mut pgzf_writer)?;
+    pgzf_writer.finish()?;
+    Ok(())
+}
 
-    match cli.command {
-        Commands::Compress {
-            input,
-            output,
-            block_size_mb,
-            group_blocks,
-            level,
-            threads,
-        } => {
-            init_rayon_pool(threads);
+fn compress_stdin(config: pgzf::PgzfConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let mut buf = Vec::new();
+    io::stdin().read_to_end(&mut buf)?;
+    let cursor = std::io::Cursor::new(Vec::new());
+    let mut pgzf_writer = pgzf::PgzfWriter::with_config(cursor, config);
+    pgzf_writer.write_all(&buf)?;
+    let cursor = pgzf_writer.finish()?;
+    io::stdout().write_all(&cursor.into_inner())?;
+    Ok(())
+}
 
-            let config = pgzf::PgzfConfig::builder()
-                .block_size_mb(block_size_mb)
-                .group_blocks(group_blocks)
-                .compression_level(level)
-                .threads(threads)
-                .build();
+fn decompress_file(
+    input: &Path,
+    output: &Option<PathBuf>,
+    seek_byte: Option<u64>,
+    limit: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file = File::open(input)?;
+    let reader = pgzf::PgzfReader::new(file)?;
+    decompress_stream(reader, output, seek_byte, limit)?;
+    Ok(())
+}
 
-            let mut reader: Box<dyn Read> = match &input {
-                Some(path) => Box::new(File::open(path)?),
-                None => Box::new(io::stdin()),
-            };
+fn decompress_stdin(
+    output: &Option<PathBuf>,
+    seek_byte: Option<u64>,
+    limit: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut buf = Vec::new();
+    io::stdin().read_to_end(&mut buf)?;
+    let cursor = std::io::Cursor::new(buf);
+    let reader = pgzf::PgzfReader::new(cursor)?;
+    decompress_stream(reader, output, seek_byte, limit)?;
+    Ok(())
+}
 
-            match output {
-                Some(path) => {
-                    let writer = File::create(path)?;
-                    let mut pgzf_writer = pgzf::PgzfWriter::with_config(writer, config);
-                    io::copy(&mut reader, &mut pgzf_writer)?;
-                    pgzf_writer.finish()?;
-                }
-                None => {
-                    let mut buf = Vec::new();
-                    reader.read_to_end(&mut buf)?;
-                    let cursor = std::io::Cursor::new(Vec::new());
-                    let mut pgzf_writer = pgzf::PgzfWriter::with_config(cursor, config);
-                    pgzf_writer.write_all(&buf)?;
-                    let cursor = pgzf_writer.finish()?;
-                    io::stdout().write_all(&cursor.into_inner())?;
-                }
-            };
+fn inspect_gzip(input: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut file = File::open(input)?;
+    let file_len = file.metadata()?.len();
+
+    // Read gzip header
+    let mut header = [0u8; 10];
+    file.read_exact(&mut header)?;
+    if header[0] != 0x1f || header[1] != 0x8b {
+        return Err("not a gzip file".into());
+    }
+
+    let cm = header[2];
+    let flg = header[3];
+    let mtime = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+
+    // Skip extra field
+    if flg & 0x04 != 0 {
+        let mut xlen_buf = [0u8; 2];
+        file.read_exact(&mut xlen_buf)?;
+        let xlen = u16::from_le_bytes(xlen_buf) as u64;
+        file.seek(io::SeekFrom::Current(xlen as i64))?;
+    }
+
+    // Skip filename
+    if flg & 0x08 != 0 {
+        let mut b = [0u8; 1];
+        loop {
+            file.read_exact(&mut b)?;
+            if b[0] == 0 {
+                break;
+            }
         }
+    }
 
-        Commands::Decompress {
-            input,
-            output,
-            seek_byte,
-            limit,
-            threads,
-        } => {
-            init_rayon_pool(threads);
-
-            match input {
-                Some(path) => {
-                    let file = File::open(path)?;
-                    let reader = pgzf::PgzfReader::new(file)?;
-                    decompress_stream(reader, &output, seek_byte, limit)?;
-                }
-                None => {
-                    let mut buf = Vec::new();
-                    io::stdin().read_to_end(&mut buf)?;
-                    let cursor = std::io::Cursor::new(buf);
-                    let reader = pgzf::PgzfReader::new(cursor)?;
-                    decompress_stream(reader, &output, seek_byte, limit)?;
-                }
-            };
+    // Skip comment
+    if flg & 0x10 != 0 {
+        let mut b = [0u8; 1];
+        loop {
+            file.read_exact(&mut b)?;
+            if b[0] == 0 {
+                break;
+            }
         }
+    }
 
-        Commands::Inspect { input } => {
-            let mut file = File::open(&input)?;
-            let index = pgzf::PgzfIndex::build(&mut file)?;
+    // Read footer: CRC32 (4) + ISIZE (4)
+    file.seek(io::SeekFrom::End(-8))?;
+    let mut footer = [0u8; 8];
+    file.read_exact(&mut footer)?;
+    let isize = u32::from_le_bytes([footer[4], footer[5], footer[6], footer[7]]);
 
+    let methods = match cm {
+        0 => "store",
+        8 => "deflate",
+        _ => "unknown",
+    };
+
+    println!("File: {}", input.display());
+    println!("PGZF: no");
+    println!("Method: {}", methods);
+    println!("Modified: {}", mtime);
+    println!("Compressed size: {} bytes", file_len);
+    println!("Uncompressed size: {} bytes", isize);
+    let ratio = if isize > 0 {
+        file_len as f64 / isize as f64
+    } else {
+        0.0
+    };
+    println!("Compression ratio: {:.2}%", ratio * 100.0);
+    Ok(())
+}
+
+fn inspect_file(input: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut file = File::open(input)?;
+
+    match pgzf::PgzfIndex::build(&mut file) {
+        Ok(index) => {
             println!("File: {}", input.display());
             println!("PGZF: yes");
             println!("Groups: {}", index.group_count());
@@ -200,6 +253,96 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 0.0
             };
             println!("Compression ratio: {:.2}%", ratio * 100.0);
+        }
+        Err(_) => {
+            inspect_gzip(input)?;
+        }
+    }
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+
+    init_rayon_pool(cli.threads);
+
+    let config = pgzf::PgzfConfig::builder()
+        .block_size_mb(cli.block_size_mb)
+        .group_blocks(cli.group_blocks)
+        .compression_level(cli.level)
+        .threads(cli.threads)
+        .build();
+
+    if cli.inspect {
+        // Inspect mode -i
+        if cli.files.is_empty() {
+            return Err("pgzf -i requires at least one file".into());
+        }
+        for file in &cli.files {
+            inspect_file(file)?;
+        }
+        return Ok(());
+    }
+
+    if cli.decompress {
+        // Decompress mode: -d
+        if cli.files.is_empty() {
+            decompress_stdin(&cli.output, cli.seek_byte, cli.limit)?;
+        } else {
+            for file in &cli.files {
+                let output = match &cli.output {
+                    Some(o) => Some(o.clone()),
+                    None if cli.stdout => None, // stdout
+                    None => Some(strip_gz_extension(file).unwrap_or_else(|| {
+                        let mut s = file.as_os_str().to_owned();
+                        s.push(".out");
+                        PathBuf::from(s)
+                    })),
+                };
+
+                decompress_file(file, &output, cli.seek_byte, cli.limit)?;
+
+                // Delete input file if not keeping and not writing to stdout
+                if !cli.keep && !cli.stdout && output.is_some() {
+                    let _ = std::fs::remove_file(file);
+                }
+            }
+        }
+    } else {
+        // Compress mode (default)
+        if cli.files.is_empty() {
+            compress_stdin(config.clone())?;
+        } else {
+            for file in &cli.files {
+                let output = match &cli.output {
+                    Some(o) => Some(o.clone()),
+                    None if cli.stdout => None, // stdout
+                    None => Some(gz_extension(file)),
+                };
+
+                if cli.stdout {
+                    // Write to stdout, don't delete input
+                    let mut reader = File::open(file)?;
+                    let cursor = std::io::Cursor::new(Vec::new());
+                    let mut pgzf_writer = pgzf::PgzfWriter::with_config(cursor, config.clone());
+                    io::copy(&mut reader, &mut pgzf_writer)?;
+                    let cursor = pgzf_writer.finish()?;
+                    io::stdout().write_all(&cursor.into_inner())?;
+                } else {
+                    let out = output.as_ref().unwrap();
+                    if !cli.force && out.exists() {
+                        return Err(
+                            format!("{}: file exists, use -f to overwrite", out.display()).into(),
+                        );
+                    }
+                    compress_file(file, out, config.clone())?;
+
+                    // Delete input file if not keeping
+                    if !cli.keep {
+                        let _ = std::fs::remove_file(file);
+                    }
+                }
+            }
         }
     }
 
