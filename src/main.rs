@@ -128,14 +128,19 @@ fn compress_file(
     Ok(())
 }
 
-fn compress_stdin(config: pgzf::PgzfConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let mut buf = Vec::new();
-    io::stdin().read_to_end(&mut buf)?;
+fn compress_stdin(
+    output: &Option<PathBuf>,
+    config: pgzf::PgzfConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     let cursor = std::io::Cursor::new(Vec::new());
     let mut pgzf_writer = pgzf::PgzfWriter::with_config(cursor, config);
-    pgzf_writer.write_all(&buf)?;
+    io::copy(&mut io::stdin(), &mut pgzf_writer)?;
     let cursor = pgzf_writer.finish()?;
-    io::stdout().write_all(&cursor.into_inner())?;
+    let data = cursor.into_inner();
+    match output {
+        Some(path) => std::fs::write(path, data)?,
+        None => io::stdout().write_all(&data)?,
+    }
     Ok(())
 }
 
@@ -311,7 +316,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         // Compress mode (default)
         if cli.files.is_empty() {
-            compress_stdin(config.clone())?;
+            compress_stdin(&cli.output, config.clone())?;
         } else {
             for file in &cli.files {
                 let output = match &cli.output {
@@ -321,7 +326,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 if cli.stdout {
-                    // Write to stdout, don't delete input
+                    // Buffer to Cursor (PgzfWriter needs Seek for backpatching)
                     let mut reader = File::open(file)?;
                     let cursor = std::io::Cursor::new(Vec::new());
                     let mut pgzf_writer = pgzf::PgzfWriter::with_config(cursor, config.clone());
