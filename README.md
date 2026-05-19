@@ -26,35 +26,50 @@ pgzf = "0.1"
 ## CLI Usage
 
 ```bash
-# Compress
-pgzf compress -i input.txt -o output.gz
-pgzf compress -b 2 -l 9 -t 4 -i input.txt -o output.gz
+# Compress (file -> file.gz)
+pgzf input.txt
 
-# Decompress
-pgzf decompress -i output.gz -o decoded.txt
-pgzf decompress -p 1000 -q 100 -i output.gz   # random access: read 100 bytes at offset 1000
+# Decompress (file.gz -> file)
+pgzf -d input.txt.gz
 
-# Inspect
-pgzf inspect output.gz
+# Stdin/stdout
+echo "hello" | pgzf > out.gz
+pgzf -d < out.gz
+
+# Keep original files
+pgzf -k input.txt
+
+# Write to stdout
+pgzf -c input.txt
+
+# Compression level 9 with 4 threads
+pgzf -l 9 -t 4 input.txt
+
+# Random access: read 100 bytes at offset 1000
+pgzf -d -s 1000 -q 100 input.txt.gz
+
+# Inspect file info
+pgzf -i input.txt.gz
 ```
 
 ### CLI Options
 
 ```
-Compress:
-  -i, --input <FILE>          Input file (default: stdin)
-  -o, --output <FILE>         Output file (default: stdout)
-  -b, --block-size-mb <MB>    Block size in MB, 1-256 [default: 1]
-  -g, --group-blocks <N>      Blocks per group [default: 8000]
-  -l, --level <1-9>           Compression level [default: 6]
-  -t, --threads <N>           Parallel threads [default: 8]
+Usage: pgzf [OPTIONS] [FILE]...
 
-Decompress:
-  -i, --input <FILE>          Input file (default: stdin)
-  -o, --output <FILE>         Output file (default: stdout)
-  -p, --seek-byte <OFFSET>    Seek to byte offset before reading
-  -q, --limit <N>             Limit output to N bytes
-  -t, --threads <N>           Parallel threads [default: 8]
+Options:
+  -d                  Decompress
+  -c                  Write to stdout, keep original files
+  -k                  Keep input files
+  -f                  Force overwrite
+  -o <OUTPUT>         Output file
+  -t <THREADS>        Number of threads [default: 8]
+  -b <BLOCK_SIZE_MB>  Block size in MB (1-256) [default: 1]
+  -g <GROUP_BLOCKS>   Number of blocks per group [default: 8000]
+  -s <SEEK_BYTE>      Seek to byte offset (decompress only)
+  -q <LIMIT>          Limit output bytes (decompress only)
+  -l <LEVEL>          Compression level (1-9) [default: 6]
+  -i                  Inspect compressed file info
 ```
 
 ## Library Usage
