@@ -190,6 +190,33 @@ impl<W: Write + Seek> PgzfWriter<W> {
         Ok(())
     }
 
+    /// Write data with block-aligned boundaries.
+    ///
+    /// 1. Flushes any buffered data from prior writes into its own blocks.
+    /// 2. Writes the given `data`.
+    /// 3. Pads so the written data ends on a block boundary.
+    ///
+    /// Returns `(start_block, block_count)` — the index of the first block
+    /// occupied by this data and the total number of blocks it spans.
+    pub fn write_with_pad(&mut self, data: &[u8]) -> Result<(u64, u64)> {
+        // Flush previously buffered data so new data starts in a fresh block
+        self.buffer_block();
+        // Force-flush the group so counter state is accurate
+        self.flush_group()?;
+
+        let start_block = self.total_blocks;
+
+        // Write new data
+        self.write_all(data)?;
+
+        // Flush any remaining buffered data as a block
+        self.buffer_block();
+        // Force-flush the group so all blocks are counted
+        self.flush_group()?;
+
+        Ok((start_block, self.total_blocks - start_block))
+    }
+
     pub fn finish(mut self) -> Result<W> {
         // Buffer any remaining data
         self.buffer_block();
@@ -237,6 +264,43 @@ mod tests {
     use std::io::{Cursor, Read, Write};
 
     use super::*;
+
+    #[test]
+    fn test_pad_block_separates_data() {
+        let block_size = 256;
+        let config = PgzfConfig::builder()
+            .block_size(block_size)
+            .group_blocks(10)
+            .build();
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = PgzfWriter::with_config(cursor, config);
+
+        // Write a partial block of 0xAA
+        let data1 = vec![0xAAu8; 100];
+        writer.write_all(&data1).unwrap();
+
+        // pad: flush current buffer as a block
+        writer.buffer_block();
+
+        // Write more data of 0xBB
+        let data2 = vec![0xBBu8; 200];
+        writer.write_all(&data2).unwrap();
+
+        let cursor = writer.finish().unwrap();
+        let output = cursor.into_inner();
+
+        // Round-trip: must return exact concatenation
+        let mut reader = crate::reader::PgzfReader::new(std::io::Cursor::new(output)).unwrap();
+        let mut decompressed = Vec::new();
+        reader.read_to_end(&mut decompressed).unwrap();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&data1);
+        expected.extend_from_slice(&data2);
+        assert_eq!(decompressed, expected, "pad_block round-trip failed");
+    }
 
     #[test]
     fn test_write_small_data() {
@@ -334,5 +398,177 @@ mod tests {
             expected.extend_from_slice(&vec![i; block_size]);
         }
         assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn test_write_with_pad_returns_correct_block_index_and_count() {
+        let block_size = 256;
+        let config = PgzfConfig::builder()
+            .block_size(block_size)
+            .group_blocks(10)
+            .build();
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = PgzfWriter::with_config(cursor, config);
+
+        // Write first chunk
+        let data1 = vec![0xAAu8; 100];
+        let (start_block, blocks) = writer.write_with_pad(&data1).unwrap();
+        assert_eq!(start_block, 0, "first chunk starts at block 0");
+        assert_eq!(blocks, 1, "100 bytes should occupy 1 block");
+
+        // Write second chunk
+        let data2 = vec![0xBBu8; 300];
+        let (start_block, blocks) = writer.write_with_pad(&data2).unwrap();
+        assert_eq!(start_block, 1, "second chunk starts at block 1");
+        assert_eq!(blocks, 2, "300 bytes should occupy 2 blocks (256 + 44)");
+
+        // Write third chunk
+        let data3 = vec![0xCCu8; 512];
+        let (start_block, blocks) = writer.write_with_pad(&data3).unwrap();
+        assert_eq!(start_block, 3, "third chunk starts at block 3");
+        assert_eq!(blocks, 2, "512 bytes should occupy exactly 2 blocks");
+
+        let cursor = writer.finish().unwrap();
+        let output = cursor.into_inner();
+
+        // Round-trip: verify data integrity
+        let mut reader = crate::reader::PgzfReader::new(std::io::Cursor::new(output)).unwrap();
+        let mut decompressed = Vec::new();
+        reader.read_to_end(&mut decompressed).unwrap();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&data1);
+        expected.extend_from_slice(&data2);
+        expected.extend_from_slice(&data3);
+        assert_eq!(decompressed, expected);
+    }
+
+    #[test]
+    fn test_write_with_pad_exact_block_multiple() {
+        let block_size = 128;
+        let config = PgzfConfig::builder()
+            .block_size(block_size)
+            .group_blocks(10)
+            .build();
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = PgzfWriter::with_config(cursor, config);
+
+        // Write data that aligns exactly to block boundaries
+        let data = vec![0xDDu8; block_size * 3]; // exactly 3 blocks
+        let (start_block, blocks) = writer.write_with_pad(&data).unwrap();
+        assert_eq!(start_block, 0);
+        assert_eq!(blocks, 3);
+
+        let cursor = writer.finish().unwrap();
+        let output = cursor.into_inner();
+
+        let mut reader = crate::reader::PgzfReader::new(std::io::Cursor::new(output)).unwrap();
+        let mut decompressed = Vec::new();
+        reader.read_to_end(&mut decompressed).unwrap();
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_write_with_pad_with_prior_buffered_data() {
+        let block_size = 256;
+        let config = PgzfConfig::builder()
+            .block_size(block_size)
+            .group_blocks(10)
+            .build();
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = PgzfWriter::with_config(cursor, config);
+
+        // Write some data without padding (stays in buffer)
+        let prior = vec![0xEEu8; 50];
+        writer.write_all(&prior).unwrap();
+
+        // Now write_with_pad should flush the prior data as its own block first
+        let data = vec![0xFFu8; 100];
+        let (start_block, blocks) = writer.write_with_pad(&data).unwrap();
+        // Prior data gets flushed into block 0, new data starts at block 1
+        assert_eq!(start_block, 1, "new data starts at block 1");
+        assert_eq!(blocks, 1, "100 bytes should occupy 1 block");
+
+        let cursor = writer.finish().unwrap();
+        let output = cursor.into_inner();
+
+        let mut reader = crate::reader::PgzfReader::new(std::io::Cursor::new(output)).unwrap();
+        let mut decompressed = Vec::new();
+        reader.read_to_end(&mut decompressed).unwrap();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&prior);
+        expected.extend_from_slice(&data);
+        assert_eq!(decompressed, expected);
+    }
+
+    #[test]
+    fn test_write_with_pad_and_read_blocks_roundtrip() {
+        // write_with_pad 和 read_blocks 的联合测试
+        let block_size = 64;
+        let config = PgzfConfig::builder()
+            .block_size(block_size)
+            .group_blocks(100)
+            .build();
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = PgzfWriter::with_config(cursor, config);
+
+        // 写入多个数据段，每段都用 write_with_pad 确保 block 边界对齐
+        let chunks: &[&[u8]] = &[
+            &[0xAAu8; 30],  // < 1 block
+            &[0xBBu8; 150], // > 2 blocks (64+64+22)
+            &[0xCCu8; 128], // exactly 2 blocks
+            &[0xDDu8; 300], // > 4 blocks
+        ];
+
+        let mut metas = Vec::new();
+        let mut all_data = Vec::new();
+        for chunk in chunks {
+            let (start_block, block_count) = writer.write_with_pad(chunk).unwrap();
+            metas.push((start_block, block_count));
+            all_data.extend_from_slice(chunk);
+        }
+
+        let cursor = writer.finish().unwrap();
+        let output = cursor.into_inner();
+
+        // 用 read_blocks 回读每一段，验证数据正确
+        let mut reader = crate::reader::PgzfReader::new(std::io::Cursor::new(&output)).unwrap();
+
+        for (i, (start_block, block_count)) in metas.iter().enumerate() {
+            let read_back = reader
+                .read_blocks(*start_block as usize, *block_count as usize)
+                .unwrap();
+            assert_eq!(
+                read_back, chunks[i],
+                "chunk {i} data mismatch via read_blocks"
+            );
+        }
+
+        // 验证完整 round-trip
+        let mut full = Vec::new();
+        let mut reader2 = crate::reader::PgzfReader::new(std::io::Cursor::new(output)).unwrap();
+        reader2.read_to_end(&mut full).unwrap();
+        assert_eq!(full, all_data);
+
+        // 验证 block 区间不重叠
+        for i in 1..metas.len() {
+            let (prev_start, prev_count) = metas[i - 1];
+            let (curr_start, _) = metas[i];
+            assert_eq!(
+                curr_start,
+                prev_start + prev_count,
+                "chunk {i} should start right after chunk {}",
+                i - 1
+            );
+        }
     }
 }

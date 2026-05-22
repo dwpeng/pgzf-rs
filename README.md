@@ -92,6 +92,36 @@ let cursor = writer.finish().unwrap();
 let compressed = cursor.into_inner();
 ```
 
+### Block-Aligned Writing
+
+Use `write_with_pad` to write data on block-aligned boundaries. It flushes any buffered data,
+writes the input, and pads to a block boundary, returning the starting block index and block count
+for the written data.
+
+```rust
+use pgzf::{PgzfWriter, PgzfConfig, PgzfReader};
+use std::io::{Write, Read, Cursor};
+
+let config = PgzfConfig::builder()
+    .block_size(256)
+    .group_blocks(100)
+    .build();
+
+let mut writer = PgzfWriter::with_config(Cursor::new(Vec::new()), config);
+
+// Write two chunks, each starting at a fresh block boundary
+let (blk1, cnt1) = writer.write_with_pad(b"chunk one data").unwrap();
+let (blk2, cnt2) = writer.write_with_pad(b"chunk two data").unwrap();
+
+let cursor = writer.finish().unwrap();
+let compressed = cursor.into_inner();
+
+// Read back chunk one by its block range
+let mut reader = PgzfReader::new(Cursor::new(&compressed)).unwrap();
+let data = reader.read_blocks(blk1 as usize, cnt1 as usize).unwrap();
+assert_eq!(&data, b"chunk one data");
+```
+
 ### Decompress
 
 ```rust
@@ -122,6 +152,21 @@ reader.seek_to_block(5).unwrap();
 
 // Standard Seek trait
 reader.seek(SeekFrom::Start(500)).unwrap();
+```
+
+### Read Block Range
+
+Use `read_blocks` to decompress a contiguous range of blocks at once. The blocks are
+decompressed in parallel internally.
+
+```rust
+use pgzf::PgzfReader;
+use std::io::Read;
+
+let mut reader = PgzfReader::new(file).unwrap();
+
+// Read blocks 2-5 (4 blocks total)
+let data = reader.read_blocks(2, 4).unwrap();
 ```
 
 ### Inspect Index

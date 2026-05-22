@@ -110,6 +110,81 @@ impl<R: Read + Seek> PgzfReader<R> {
         Ok(())
     }
 
+    /// Read a contiguous range of blocks and return their decompressed data.
+    ///
+    /// This seeks to the given `start_block`, reads `count` consecutive data blocks
+    /// (skipping index blocks), and decompresses them in parallel.
+    ///
+    /// After this call, the reader's position is at the end of the last read block;
+    /// subsequent reads will continue from there.
+    pub fn read_blocks(&mut self, start_block: usize, count: usize) -> Result<Vec<u8>> {
+        if !self.is_pgzf {
+            return Err(PgzfError::IndexNotAvailable);
+        }
+
+        let index = self.index.as_ref().unwrap();
+        let total_blocks = index.block_count();
+
+        if start_block >= total_blocks {
+            return Err(PgzfError::SeekBeyondEnd {
+                target: start_block as u64,
+                total: total_blocks as u64,
+            });
+        }
+
+        let end_block = total_blocks.min(start_block + count);
+        let actual_count = end_block - start_block;
+
+        if actual_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Seek to start block's compressed offset
+        let offset = index.compressed_offset(start_block).unwrap();
+        self.inner.seek(SeekFrom::Start(offset))?;
+
+        // Read raw blocks sequentially, skipping IDX blocks
+        let mut raw_batch: Vec<(Vec<u8>, usize)> = Vec::with_capacity(actual_count);
+        let mut blocks_read = 0;
+        while blocks_read < actual_count {
+            match self.read_one_raw_block()? {
+                Some((raw, header_size, _zc, block_type)) => {
+                    if block_type == BlockType::Idx {
+                        continue;
+                    }
+                    raw_batch.push((raw, header_size));
+                    blocks_read += 1;
+                }
+                None => break,
+            }
+        }
+
+        // Decompress in parallel
+        let decompressed = raw_batch
+            .par_iter()
+            .map(|(raw, header_size)| -> Result<Vec<u8>> {
+                let data = Self::decompress_raw_block(raw, *header_size)?;
+                Ok(data)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Concatenate
+        let total_size: usize = decompressed.iter().map(|d| d.len()).sum();
+        let mut result = Vec::with_capacity(total_size);
+        for data in &decompressed {
+            result.extend_from_slice(data);
+        }
+
+        // Reset reader state — file position has moved
+        self.current_block.clear();
+        self.current_pos = 0;
+        self.eof = false;
+        self.pending_seek = None;
+        self.readahead.clear();
+
+        Ok(result)
+    }
+
     fn execute_pending_seek(&mut self) -> std::io::Result<()> {
         if let Some(target_byte) = self.pending_seek.take() {
             let index = self.index.as_ref().ok_or_else(|| {
@@ -533,5 +608,100 @@ mod tests {
         let n = reader.read(&mut output).unwrap();
         assert_eq!(n, 20);
         assert_eq!(output, &original[offset..offset + 20]);
+    }
+
+    #[test]
+    fn test_read_blocks_range() {
+        let block_size = 64;
+        let num_blocks = 10;
+        let original: Vec<u8> = (0..num_blocks)
+            .flat_map(|i| vec![i as u8; block_size])
+            .collect();
+        let pgzf_data = create_pgzf_data(&original, block_size);
+        let cursor = Cursor::new(pgzf_data);
+        let mut reader = PgzfReader::new(cursor).unwrap();
+
+        // Read blocks 2-5 (4 blocks: indices 2, 3, 4, 5)
+        let data = reader.read_blocks(2, 4).unwrap();
+        let expected: Vec<u8> = (2..6).flat_map(|i| vec![i as u8; block_size]).collect();
+        assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn test_read_blocks_all() {
+        let block_size = 64;
+        let num_blocks = 5;
+        let original: Vec<u8> = (0..num_blocks)
+            .flat_map(|i| vec![i as u8; block_size])
+            .collect();
+        let pgzf_data = create_pgzf_data(&original, block_size);
+        let cursor = Cursor::new(pgzf_data);
+        let mut reader = PgzfReader::new(cursor).unwrap();
+
+        let data = reader.read_blocks(0, num_blocks).unwrap();
+        assert_eq!(data, original);
+    }
+
+    #[test]
+    fn test_read_blocks_count_truncated() {
+        let block_size = 64;
+        let num_blocks = 3;
+        let original: Vec<u8> = (0..num_blocks)
+            .flat_map(|i| vec![i as u8; block_size])
+            .collect();
+        let pgzf_data = create_pgzf_data(&original, block_size);
+        let cursor = Cursor::new(pgzf_data);
+        let mut reader = PgzfReader::new(cursor).unwrap();
+
+        // Request more blocks than available
+        let data = reader.read_blocks(1, 10).unwrap();
+        let expected: Vec<u8> = (1..3).flat_map(|i| vec![i as u8; block_size]).collect();
+        assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn test_read_blocks_subsequent_read() {
+        // After read_blocks, subsequent reads should continue from where we left off
+        let block_size = 64;
+        let num_blocks = 8;
+        let original: Vec<u8> = (0..num_blocks)
+            .flat_map(|i| vec![i as u8; block_size])
+            .collect();
+        let pgzf_data = create_pgzf_data(&original, block_size);
+        let cursor = Cursor::new(pgzf_data);
+        let mut reader = PgzfReader::new(cursor).unwrap();
+
+        // Read first 3 blocks
+        let data = reader.read_blocks(0, 3).unwrap();
+        assert_eq!(data.len(), block_size * 3);
+
+        // Read remaining via normal Read trait
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, original[block_size * 3..]);
+    }
+
+    #[test]
+    fn test_read_blocks_zero_count() {
+        let block_size = 64;
+        let original = vec![0x42u8; block_size * 3];
+        let pgzf_data = create_pgzf_data(&original, block_size);
+        let cursor = Cursor::new(pgzf_data);
+        let mut reader = PgzfReader::new(cursor).unwrap();
+
+        let data = reader.read_blocks(0, 0).unwrap();
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn test_read_blocks_out_of_range() {
+        let block_size = 64;
+        let original = vec![0x42u8; block_size * 2];
+        let pgzf_data = create_pgzf_data(&original, block_size);
+        let cursor = Cursor::new(pgzf_data);
+        let mut reader = PgzfReader::new(cursor).unwrap();
+
+        let result = reader.read_blocks(10, 1);
+        assert!(result.is_err());
     }
 }
