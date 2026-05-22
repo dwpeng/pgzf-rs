@@ -12,6 +12,7 @@ use crate::{
 struct PendingBlock {
     data: Vec<u8>,
     block_type: BlockType,
+    flag: Option<u32>,
 }
 
 struct CompressedBlock {
@@ -34,6 +35,7 @@ pub struct PgzfWriter<W: Write + Seek> {
     total_compressed: u64,
     total_blocks: u64,
     gc_pending: bool,
+    block_flag: Option<u32>,
 }
 
 impl<W: Write + Seek> PgzfWriter<W> {
@@ -56,6 +58,7 @@ impl<W: Write + Seek> PgzfWriter<W> {
             total_compressed: 0,
             total_blocks: 0,
             gc_pending: false,
+            block_flag: None,
         }
     }
 
@@ -79,7 +82,11 @@ impl<W: Write + Seek> PgzfWriter<W> {
         };
 
         let data = self.buffer[..self.buffer_len].to_vec();
-        self.pending_blocks.push(PendingBlock { data, block_type });
+        self.pending_blocks.push(PendingBlock {
+            data,
+            block_type,
+            flag: self.block_flag,
+        });
 
         self.blocks_in_group += 1;
         self.buffer_len = 0;
@@ -97,19 +104,24 @@ impl<W: Write + Seek> PgzfWriter<W> {
         data: &[u8],
         block_type: BlockType,
         level: u32,
+        flag: Option<u32>,
     ) -> Result<CompressedBlock> {
         let compressed = crate::compress::compress_block(data, level)?;
         let crc = crc32fast::hash(data);
 
-        let header_size = match block_type {
-            BlockType::Beg => BEG_HEADER_SIZE,
-            _ => DAT_HEADER_SIZE,
+        let header_size = match (block_type, flag) {
+            (BlockType::Beg, Some(_)) => BEG_FLAG_HEADER_SIZE,
+            (BlockType::Beg, None) => BEG_HEADER_SIZE,
+            (_, Some(_)) => DAT_FLAG_HEADER_SIZE,
+            (_, None) => DAT_HEADER_SIZE,
         };
         let zc = (header_size + compressed.len() + PGZF_TAIL_SIZE) as u32;
 
-        let header = match block_type {
-            BlockType::Beg => format::build_beg_header(zc).to_vec(),
-            _ => format::build_dat_header(zc).to_vec(),
+        let header: Vec<u8> = match (block_type, flag) {
+            (BlockType::Beg, Some(fl)) => format::build_beg_header_with_flag(zc, fl).to_vec(),
+            (BlockType::Beg, None) => format::build_beg_header(zc).to_vec(),
+            (_, Some(fl)) => format::build_dat_header_with_flag(zc, fl).to_vec(),
+            (_, None) => format::build_dat_header(zc).to_vec(),
         };
 
         let mut trailer = [0u8; PGZF_TAIL_SIZE];
@@ -136,7 +148,9 @@ impl<W: Write + Seek> PgzfWriter<W> {
         let compressed: Vec<CompressedBlock> = self
             .pending_blocks
             .par_iter()
-            .map(|block| Self::compress_single_block(&block.data, block.block_type, level))
+            .map(|block| {
+                Self::compress_single_block(&block.data, block.block_type, level, block.flag)
+            })
             .collect::<Result<Vec<_>>>()?;
 
         // Sequential write: maintain block order
@@ -209,12 +223,29 @@ impl<W: Write + Seek> PgzfWriter<W> {
         // Write new data
         self.write_all(data)?;
 
-        // Flush any remaining buffered data as a block
-        self.buffer_block();
+        // Pad: flush any remaining buffered data as a block
+        self.pad_block();
         // Force-flush the group so all blocks are counted
         self.flush_group()?;
 
         Ok((start_block, self.total_blocks - start_block))
+    }
+
+    /// Set a flag value that will be embedded in subsequent blocks.
+    /// The flag persists until changed or cleared.
+    pub fn set_block_flag(&mut self, flag: u32) {
+        self.block_flag = Some(flag);
+    }
+
+    /// Clear the block flag; subsequent blocks will have no flag.
+    pub fn clear_block_flag(&mut self) {
+        self.block_flag = None;
+    }
+
+    /// Ensure all buffered data is written to a block, so subsequent writes
+    /// will not share a block with data already written.
+    pub(crate) fn pad_block(&mut self) {
+        self.buffer_block();
     }
 
     pub fn finish(mut self) -> Result<W> {
@@ -570,5 +601,64 @@ mod tests {
                 i - 1
             );
         }
+    }
+
+    #[test]
+    fn test_block_flag_roundtrip() {
+        let block_size = 256;
+        let config = PgzfConfig::builder()
+            .block_size(block_size)
+            .group_blocks(10)
+            .build();
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = PgzfWriter::with_config(cursor, config);
+
+        // Write data with flag=1, then flag=2, then no flag
+        writer.set_block_flag(1);
+        writer.write_with_pad(b"hello with flag 1").unwrap();
+
+        writer.set_block_flag(2);
+        writer.write_with_pad(b"flag 2 data").unwrap();
+
+        writer.clear_block_flag();
+        writer.write_with_pad(b"no flag data").unwrap();
+
+        let cursor = writer.finish().unwrap();
+        let output = cursor.into_inner();
+
+        // Read block by block and check flags
+        let mut reader = crate::reader::PgzfReader::new(std::io::Cursor::new(&output)).unwrap();
+
+        // Block 0: flag=1, data="hello with flag 1"
+        let mut chunk = vec![0u8; 17];
+        reader.read_exact(&mut chunk).unwrap();
+        assert_eq!(&chunk, b"hello with flag 1");
+        assert_eq!(
+            reader.current_block_flag(),
+            Some(1),
+            "first chunk should have flag=1"
+        );
+
+        // Block 1: flag=2, data="flag 2 data"
+        let mut chunk = vec![0u8; 11];
+        reader.read_exact(&mut chunk).unwrap();
+        assert_eq!(&chunk, b"flag 2 data");
+        assert_eq!(
+            reader.current_block_flag(),
+            Some(2),
+            "second chunk should have flag=2"
+        );
+
+        // Block 2: no flag, data="no flag data"
+        let mut chunk = vec![0u8; 12];
+        reader.read_exact(&mut chunk).unwrap();
+        assert_eq!(&chunk, b"no flag data");
+        assert_eq!(
+            reader.current_block_flag(),
+            None,
+            "third chunk should have no flag"
+        );
     }
 }

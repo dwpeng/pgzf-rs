@@ -66,7 +66,7 @@ pub use constants::{
 pub use error::{PgzfError, Result};
 pub use format::{PgzfConfig, PgzfConfigBuilder};
 pub use index::{BlockMeta, PgzfIndex};
-pub use reader::PgzfReader;
+pub use reader::{PgzfReader, RawBlock};
 pub use writer::PgzfWriter;
 
 /// Block type within a PGZF group.

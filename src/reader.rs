@@ -17,10 +17,16 @@ const DEFAULT_READAHEAD: usize = 8;
 
 struct BufferedBlock {
     data: Vec<u8>,
+    flag: Option<u32>,
 }
 
-/// (raw_bytes, header_size, compressed_size, block_type)
-type RawBlock = (Vec<u8>, usize, u32, BlockType);
+pub struct RawBlock {
+    pub raw: Vec<u8>,
+    pub header_size: usize,
+    pub block_type: BlockType,
+    pub flag: Option<u32>,
+    pub block_index: usize,
+}
 
 pub struct PgzfReader<R: Read + Seek> {
     inner: R,
@@ -28,10 +34,12 @@ pub struct PgzfReader<R: Read + Seek> {
     index: Option<PgzfIndex>,
     current_block: Vec<u8>,
     current_pos: usize,
+    current_block_flag: Option<u32>,
     eof: bool,
     pending_seek: Option<u64>,
     readahead: VecDeque<BufferedBlock>,
     readahead_size: usize,
+    next_block_index: usize,
 }
 
 impl<R: Read + Seek> PgzfReader<R> {
@@ -57,10 +65,12 @@ impl<R: Read + Seek> PgzfReader<R> {
             index,
             current_block: Vec::new(),
             current_pos: 0,
+            current_block_flag: None,
             eof: false,
             pending_seek: None,
             readahead: VecDeque::new(),
             readahead_size: DEFAULT_READAHEAD,
+            next_block_index: 0,
         })
     }
 
@@ -84,12 +94,70 @@ impl<R: Read + Seek> PgzfReader<R> {
         self.index.as_ref().map(|i| i.block_count())
     }
 
+    /// Returns the flag value of the currently loaded block, if any.
+    pub fn current_block_flag(&self) -> Option<u32> {
+        self.current_block_flag
+    }
+
+    /// Scan block flags without decompressing block data.
+    ///
+    /// Scans up to `count` data blocks. Pass `None` to scan all blocks.
+    /// Returns a list of `(block_index, flag)` for each data block scanned.
+    /// Much faster than reading/decompressing because only headers are parsed.
+    ///
+    /// After calling this method the reader is in a clean state (no pending seek,
+    /// no cached blocks). Use `seek_to_block` or `seek_to_byte` to navigate to
+    /// a specific position.
+    pub fn scan_block_flags(&mut self, count: Option<usize>) -> Result<Vec<(usize, Option<u32>)>> {
+        if !self.is_pgzf {
+            return Err(PgzfError::IndexNotAvailable);
+        }
+
+        self.next_block_index = 0;
+        self.inner.seek(SeekFrom::Start(0))?;
+
+        let limit = count.unwrap_or(usize::MAX);
+        let mut flags = Vec::new();
+
+        loop {
+            if flags.len() >= limit {
+                break;
+            }
+            match self.read_one_raw_block()? {
+                Some(RawBlock {
+                    block_type,
+                    block_index,
+                    flag,
+                    ..
+                }) => {
+                    if block_type == BlockType::Idx {
+                        continue;
+                    }
+                    flags.push((block_index, flag));
+                }
+                None => break,
+            }
+        }
+
+        // Reset reader state since the file position has moved
+        self.current_block.clear();
+        self.current_block_flag = None;
+        self.current_pos = 0;
+        self.eof = false;
+        self.pending_seek = None;
+        self.readahead.clear();
+
+        Ok(flags)
+    }
+
     pub fn seek_to_byte(&mut self, offset: u64) -> Result<()> {
         if !self.is_pgzf {
             return Err(PgzfError::IndexNotAvailable);
         }
         self.pending_seek = Some(offset);
+        self.next_block_index = 0;
         self.current_block.clear();
+        self.current_block_flag = None;
         self.current_pos = 0;
         self.readahead.clear();
         Ok(())
@@ -102,7 +170,9 @@ impl<R: Read + Seek> PgzfReader<R> {
         let index = self.index.as_ref().unwrap();
         let compressed_offset = index.seek_block(block_index)?;
         self.inner.seek(SeekFrom::Start(compressed_offset))?;
+        self.next_block_index = 0;
         self.current_block.clear();
+        self.current_block_flag = None;
         self.current_pos = 0;
         self.eof = false;
         self.pending_seek = None;
@@ -142,13 +212,19 @@ impl<R: Read + Seek> PgzfReader<R> {
         // Seek to start block's compressed offset
         let offset = index.compressed_offset(start_block).unwrap();
         self.inner.seek(SeekFrom::Start(offset))?;
+        self.next_block_index = start_block;
 
         // Read raw blocks sequentially, skipping IDX blocks
         let mut raw_batch: Vec<(Vec<u8>, usize)> = Vec::with_capacity(actual_count);
         let mut blocks_read = 0;
         while blocks_read < actual_count {
             match self.read_one_raw_block()? {
-                Some((raw, header_size, _zc, block_type)) => {
+                Some(RawBlock {
+                    raw,
+                    header_size,
+                    block_type,
+                    ..
+                }) => {
                     if block_type == BlockType::Idx {
                         continue;
                     }
@@ -177,6 +253,7 @@ impl<R: Read + Seek> PgzfReader<R> {
 
         // Reset reader state — file position has moved
         self.current_block.clear();
+        self.current_block_flag = None;
         self.current_pos = 0;
         self.eof = false;
         self.pending_seek = None;
@@ -199,7 +276,9 @@ impl<R: Read + Seek> PgzfReader<R> {
             })?;
 
             self.inner.seek(SeekFrom::Start(compressed_offset))?;
+            self.next_block_index = block_idx;
             self.current_block.clear();
+            self.current_block_flag = None;
             self.current_pos = 0;
             self.eof = false;
             self.readahead.clear();
@@ -217,14 +296,16 @@ impl<R: Read + Seek> PgzfReader<R> {
     }
 
     /// Read one raw PGZF block from the current file position.
-    /// Returns (raw_bytes, header_size, zc, block_type) or None at EOF.
-    fn read_one_raw_block(&mut self) -> std::io::Result<Option<RawBlock>> {
+    ///
+    /// Returns the raw gzip member (header + deflate + trailer) without decompressing.
+    /// Useful for low-level inspection or custom processing.
+    pub fn read_one_raw_block(&mut self) -> Result<Option<RawBlock>> {
         // Read fixed 10-byte gzip header
         let mut header_buf = [0u8; GZIP_FIXED_HEADER_SIZE];
         match self.inner.read_exact(&mut header_buf) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e),
+            Err(e) => return Err(PgzfError::Io(e)),
         }
 
         // Read XLEN
@@ -236,21 +317,27 @@ impl<R: Read + Seek> PgzfReader<R> {
         let mut extra = vec![0u8; xlen];
         self.inner.read_exact(&mut extra)?;
 
-        // Parse tags to get ZC and determine block type
+        // Parse tags to get ZC, determine block type, and extract flag
         let mut zc: u32 = 0;
         let mut has_gc = false;
         let mut has_ix = false;
+        let mut flag: Option<u32> = None;
         let mut eoff = 0;
         while eoff + 4 <= extra.len() {
             let tag = [extra[eoff], extra[eoff + 1]];
             let slen = u16::from_le_bytes([extra[eoff + 2], extra[eoff + 3]]) as usize;
             eoff += 4;
-            if tag == TAG_ZC && slen >= 4 && eoff + 4 <= extra.len() {
+            if eoff + slen > extra.len() {
+                break;
+            }
+            if tag == TAG_ZC && slen >= 4 {
                 zc = read_u32_le(&extra[eoff..eoff + 4]);
             } else if tag == TAG_GC {
                 has_gc = true;
             } else if tag == TAG_IX {
                 has_ix = true;
+            } else if tag == TAG_FL && slen >= 4 {
+                flag = Some(read_u32_le(&extra[eoff..eoff + 4]));
             }
             eoff += slen;
         }
@@ -263,16 +350,24 @@ impl<R: Read + Seek> PgzfReader<R> {
             BlockType::Dat
         };
 
+        let block_index = match block_type {
+            BlockType::Idx => self.next_block_index,
+            _ => {
+                let idx = self.next_block_index;
+                self.next_block_index += 1;
+                idx
+            }
+        };
+
         if zc == 0 {
             return Ok(None);
         }
 
         // Sanity check: ZC shouldn't exceed 1GB
         if zc > 1 << 30 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("block size too large: {zc} bytes"),
-            ));
+            return Err(PgzfError::InvalidFormat(format!(
+                "block size too large: {zc} bytes"
+            )));
         }
 
         let header_size = GZIP_FIXED_HEADER_SIZE + 2 + xlen;
@@ -287,10 +382,13 @@ impl<R: Read + Seek> PgzfReader<R> {
         raw.extend_from_slice(&extra);
         raw.extend_from_slice(&rest);
 
-        // File position is now at start of next block (start_pos + zc)
-        // No seek needed - sequential read
-
-        Ok(Some((raw, header_size, zc, block_type)))
+        Ok(Some(RawBlock {
+            raw,
+            header_size,
+            block_type,
+            flag,
+            block_index,
+        }))
     }
 
     /// Decompress a raw PGZF block in memory (for parallel use).
@@ -350,25 +448,40 @@ impl<R: Read + Seek> PgzfReader<R> {
         }
 
         // Read raw blocks sequentially from current file position
-        let mut raw_batch: Vec<(Vec<u8>, usize)> = Vec::new();
+        struct RawWithMeta {
+            raw: Vec<u8>,
+            header_size: usize,
+            flag: Option<u32>,
+        }
+        let mut raw_batch: Vec<RawWithMeta> = Vec::new();
         let mut data_blocks_read = 0;
         let batch_limit = self.readahead_size;
         let mut hit_eof = false;
 
         while data_blocks_read < batch_limit {
             match self.read_one_raw_block() {
-                Ok(Some((raw, header_size, _zc, block_type))) => {
+                Ok(Some(RawBlock {
+                    raw,
+                    header_size,
+                    block_type,
+                    flag,
+                    ..
+                })) => {
                     if block_type == BlockType::Idx {
                         continue;
                     }
-                    raw_batch.push((raw, header_size));
+                    raw_batch.push(RawWithMeta {
+                        raw,
+                        header_size,
+                        flag,
+                    });
                     data_blocks_read += 1;
                 }
                 Ok(None) => {
                     hit_eof = true;
                     break;
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.into()),
             }
         }
 
@@ -380,9 +493,9 @@ impl<R: Read + Seek> PgzfReader<R> {
         // Decompress all blocks in parallel
         let decompressed: Vec<BufferedBlock> = raw_batch
             .par_iter()
-            .map(|(raw, header_size)| {
-                let data = Self::decompress_raw_block(raw, *header_size)?;
-                Ok::<_, std::io::Error>(BufferedBlock { data })
+            .map(|m| {
+                let data = Self::decompress_raw_block(&m.raw, m.header_size)?;
+                Ok::<_, std::io::Error>(BufferedBlock { data, flag: m.flag })
             })
             .collect::<std::io::Result<Vec<_>>>()?;
 
@@ -449,6 +562,7 @@ impl<R: Read + Seek> Read for PgzfReader<R> {
         if self.is_pgzf {
             // Serve from readahead buffer
             if let Some(next) = self.readahead.pop_front() {
+                self.current_block_flag = next.flag;
                 self.current_block = next.data;
                 self.current_pos = 0;
                 let take = self.current_block.len().min(buf.len());
@@ -461,6 +575,7 @@ impl<R: Read + Seek> Read for PgzfReader<R> {
             self.fill_readahead()?;
 
             if let Some(next) = self.readahead.pop_front() {
+                self.current_block_flag = next.flag;
                 self.current_block = next.data;
                 self.current_pos = 0;
                 let take = self.current_block.len().min(buf.len());
@@ -513,7 +628,9 @@ impl<R: Read + Seek> Seek for PgzfReader<R> {
         };
 
         self.pending_seek = Some(target);
+        self.next_block_index = 0;
         self.current_block.clear();
+        self.current_block_flag = None;
         self.current_pos = 0;
         self.readahead.clear();
         Ok(target)
@@ -703,5 +820,99 @@ mod tests {
 
         let result = reader.read_blocks(10, 1);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_scan_block_flags() {
+        let block_size = 64;
+        let config = crate::format::PgzfConfig::builder()
+            .block_size(block_size)
+            .group_blocks(100)
+            .build();
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = crate::writer::PgzfWriter::with_config(cursor, config);
+
+        writer.set_block_flag(10);
+        writer.write_with_pad(b"flag10 data").unwrap();
+        writer.set_block_flag(20);
+        writer.write_with_pad(b"flag20 longer data").unwrap();
+        writer.clear_block_flag();
+        writer.write_with_pad(b"no flag").unwrap();
+
+        let cursor = writer.finish().unwrap();
+        let pgzf_data = cursor.into_inner();
+
+        let mut reader = PgzfReader::new(Cursor::new(&pgzf_data)).unwrap();
+        let flags = reader.scan_block_flags(None).unwrap();
+
+        assert_eq!(flags.len(), 3);
+        assert_eq!(flags[0], (0, Some(10)));
+        assert_eq!(flags[1], (1, Some(20)));
+        assert_eq!(flags[2], (2, None));
+    }
+
+    #[test]
+    fn test_scan_block_flags_allows_seek_then_read() {
+        // After scan_block_flags, the reader is reset. Seek to a block and read.
+        let block_size = 64;
+        let config = crate::format::PgzfConfig::builder()
+            .block_size(block_size)
+            .group_blocks(100)
+            .build();
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = crate::writer::PgzfWriter::with_config(cursor, config);
+
+        writer.set_block_flag(100);
+        writer.write_with_pad(&[0xABu8; 30]).unwrap();
+        writer.set_block_flag(200);
+        writer.write_with_pad(&[0xCDu8; 50]).unwrap();
+
+        let cursor = writer.finish().unwrap();
+        let pgzf_data = cursor.into_inner();
+
+        let mut reader = PgzfReader::new(Cursor::new(&pgzf_data)).unwrap();
+        let flags = reader.scan_block_flags(None).unwrap();
+
+        // Find block with flag=200 and read its data
+        for (idx, flag) in &flags {
+            if *flag == Some(200) {
+                let data = reader.read_blocks(*idx, 1).unwrap();
+                assert_eq!(data, vec![0xCDu8; 50]);
+                return;
+            }
+        }
+        panic!("flag=200 not found");
+    }
+
+    #[test]
+    fn test_scan_block_flags_with_limit() {
+        let block_size = 64;
+        let config = crate::format::PgzfConfig::builder()
+            .block_size(block_size)
+            .group_blocks(100)
+            .build();
+
+        use std::io::Write;
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = crate::writer::PgzfWriter::with_config(cursor, config);
+
+        for i in 0..10u8 {
+            writer.set_block_flag(i as u32);
+            writer.write_with_pad(&[i; 30]).unwrap();
+        }
+
+        let cursor = writer.finish().unwrap();
+        let pgzf_data = cursor.into_inner();
+
+        let mut reader = PgzfReader::new(Cursor::new(&pgzf_data)).unwrap();
+        let flags = reader.scan_block_flags(Some(4)).unwrap();
+        assert_eq!(flags.len(), 4);
+        assert_eq!(flags[0], (0, Some(0)));
+        assert_eq!(flags[3], (3, Some(3)));
     }
 }

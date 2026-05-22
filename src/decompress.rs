@@ -45,7 +45,7 @@ pub(crate) fn read_pgzf_block<R: Read + Seek>(
     full_extra[..2].copy_from_slice(&xlen_buf);
     full_extra[2..].copy_from_slice(&extra);
 
-    let (zc, gc, ix) = parse_extra_field(&full_extra, is_pgzf)?;
+    let (zc, gc, ix, _fl) = parse_extra_field(&full_extra, is_pgzf)?;
     let block_type = determine_block_type(gc, &ix);
 
     let header_size = match block_type {

@@ -11,7 +11,9 @@ pub(crate) const PGZF_XFL_MARKER: u8 = 0xAA;
 // Header sizes
 pub(crate) const GZIP_FIXED_HEADER_SIZE: usize = 10;
 pub(crate) const BEG_HEADER_SIZE: usize = 32;
+pub(crate) const BEG_FLAG_HEADER_SIZE: usize = 40;
 pub(crate) const DAT_HEADER_SIZE: usize = 20;
+pub(crate) const DAT_FLAG_HEADER_SIZE: usize = 28;
 pub(crate) const IDX_HEADER_BASE_SIZE: usize = 24;
 pub(crate) const PGZF_TAIL_SIZE: usize = 8;
 
@@ -23,6 +25,7 @@ pub(crate) const GC_VALUE_OFFSET: usize = 24;
 pub(crate) const TAG_ZC: [u8; 2] = [0x5A, 0x43];
 pub(crate) const TAG_GC: [u8; 2] = [0x47, 0x43];
 pub(crate) const TAG_IX: [u8; 2] = [0x49, 0x58];
+pub(crate) const TAG_FL: [u8; 2] = [0x46, 0x4C];
 
 // Defaults (public for users who want to reference them)
 pub const DEFAULT_BLOCK_SIZE: usize = 1 << 20;
