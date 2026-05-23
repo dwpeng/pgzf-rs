@@ -31,4 +31,3 @@ pub(crate) const TAG_FL: [u8; 2] = [0x46, 0x4C];
 pub const DEFAULT_BLOCK_SIZE: usize = 1 << 20;
 pub const DEFAULT_GROUP_BLOCKS: usize = 8000;
 pub const DEFAULT_COMPRESSION_LEVEL: u32 = 6;
-pub const DEFAULT_THREADS: usize = 8;

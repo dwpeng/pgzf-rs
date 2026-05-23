@@ -252,7 +252,6 @@ pub struct PgzfConfig {
     pub block_size: usize,
     pub group_blocks: usize,
     pub compression_level: u32,
-    pub threads: usize,
 }
 
 impl Default for PgzfConfig {
@@ -261,7 +260,6 @@ impl Default for PgzfConfig {
             block_size: DEFAULT_BLOCK_SIZE,
             group_blocks: DEFAULT_GROUP_BLOCKS,
             compression_level: DEFAULT_COMPRESSION_LEVEL,
-            threads: DEFAULT_THREADS,
         }
     }
 }
@@ -295,11 +293,6 @@ impl PgzfConfigBuilder {
 
     pub fn compression_level(mut self, level: u32) -> Self {
         self.config.compression_level = level.clamp(1, 9);
-        self
-    }
-
-    pub fn threads(mut self, n: usize) -> Self {
-        self.config.threads = n.max(1);
         self
     }
 
@@ -415,11 +408,9 @@ mod tests {
             .block_size_mb(2)
             .group_blocks(4000)
             .compression_level(9)
-            .threads(4)
             .build();
         assert_eq!(config.block_size, 2 * 1024 * 1024);
         assert_eq!(config.group_blocks, 4000);
         assert_eq!(config.compression_level, 9);
-        assert_eq!(config.threads, 4);
     }
 }

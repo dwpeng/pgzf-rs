@@ -74,6 +74,11 @@ impl<R: Read + Seek> PgzfReader<R> {
         })
     }
 
+    pub fn with_readahead(mut self, size: usize) -> Self {
+        self.readahead_size = size.max(1);
+        self
+    }
+
     pub fn is_pgzf(&self) -> bool {
         self.is_pgzf
     }
@@ -97,6 +102,30 @@ impl<R: Read + Seek> PgzfReader<R> {
     /// Returns the flag value of the currently loaded block, if any.
     pub fn current_block_flag(&self) -> Option<u32> {
         self.current_block_flag
+    }
+
+    /// Returns the current readahead batch size (number of blocks prefetched
+    /// and decompressed in parallel).
+    pub fn readahead_size(&self) -> usize {
+        self.readahead_size
+    }
+
+    /// Set the number of blocks to prefetch and decompress in parallel.
+    ///
+    /// A larger value increases memory usage but can improve throughput on
+    /// multi-core systems. The default is 8.
+    ///
+    /// Parallel decompression uses the global rayon thread pool. To control the
+    /// number of threads, configure rayon before creating a reader:
+    ///
+    /// ```rust,no_run
+    /// rayon::ThreadPoolBuilder::new()
+    ///     .num_threads(4)
+    ///     .build_global()
+    ///     .unwrap();
+    /// ```
+    pub fn set_readahead_size(&mut self, n: usize) {
+        self.readahead_size = n.max(1);
     }
 
     /// Scan block flags without decompressing block data.
@@ -896,7 +925,6 @@ mod tests {
             .group_blocks(100)
             .build();
 
-        use std::io::Write;
         let buf = Vec::new();
         let cursor = Cursor::new(buf);
         let mut writer = crate::writer::PgzfWriter::with_config(cursor, config);
@@ -914,5 +942,32 @@ mod tests {
         assert_eq!(flags.len(), 4);
         assert_eq!(flags[0], (0, Some(0)));
         assert_eq!(flags[3], (3, Some(3)));
+    }
+
+    #[test]
+    fn test_set_readahead_size() {
+        let block_size = 64;
+        let config = crate::format::PgzfConfig::builder()
+            .block_size(block_size)
+            .group_blocks(100)
+            .build();
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = crate::writer::PgzfWriter::with_config(cursor, config);
+        writer.write_all(&vec![0xABu8; block_size * 20]).unwrap();
+        let cursor = writer.finish().unwrap();
+        let pgzf_data = cursor.into_inner();
+
+        let mut reader = PgzfReader::new(Cursor::new(&pgzf_data)).unwrap();
+        assert_eq!(reader.readahead_size(), 8);
+
+        reader.set_readahead_size(16);
+        assert_eq!(reader.readahead_size(), 16);
+
+        // Verify it still reads correctly
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        assert_eq!(output.len(), block_size * 20);
     }
 }

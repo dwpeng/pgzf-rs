@@ -149,9 +149,10 @@ fn decompress_file(
     output: &Option<PathBuf>,
     seek_byte: Option<u64>,
     limit: Option<u64>,
+    threads: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let file = File::open(input)?;
-    let reader = pgzf::PgzfReader::new(file)?;
+    let reader = pgzf::PgzfReader::new(file)?.with_readahead(threads);
     decompress_stream(reader, output, seek_byte, limit)?;
     Ok(())
 }
@@ -275,7 +276,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .block_size_mb(cli.block_size_mb)
         .group_blocks(cli.group_blocks)
         .compression_level(cli.level)
-        .threads(cli.threads)
         .build();
 
     if cli.inspect {
@@ -305,7 +305,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     })),
                 };
 
-                decompress_file(file, &output, cli.seek_byte, cli.limit)?;
+                decompress_file(file, &output, cli.seek_byte, cli.limit, cli.threads)?;
 
                 // Delete input file if not keeping and not writing to stdout
                 if !cli.keep && !cli.stdout && output.is_some() {

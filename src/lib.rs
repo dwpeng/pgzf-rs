@@ -60,9 +60,7 @@ pub mod reader;
 pub mod writer;
 
 // Re-export constants that users might need
-pub use constants::{
-    DEFAULT_BLOCK_SIZE, DEFAULT_COMPRESSION_LEVEL, DEFAULT_GROUP_BLOCKS, DEFAULT_THREADS,
-};
+pub use constants::{DEFAULT_BLOCK_SIZE, DEFAULT_COMPRESSION_LEVEL, DEFAULT_GROUP_BLOCKS};
 pub use error::{PgzfError, Result};
 pub use format::{PgzfConfig, PgzfConfigBuilder};
 pub use index::{BlockMeta, PgzfIndex};
