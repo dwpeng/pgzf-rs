@@ -49,6 +49,61 @@
 //! // Standard Seek trait
 //! reader.seek(SeekFrom::Start(500)).unwrap();
 //! ```
+//!
+//! ## Block-Aligned Writing
+//!
+//! Use `write_with_pad` to write data on block-aligned boundaries. Returns the starting
+//! block index and block count for the written data:
+//!
+//! ```no_run
+//! use pgzf::{PgzfWriter, PgzfConfig};
+//! use std::io::Write;
+//!
+//! # let config = PgzfConfig::default();
+//! # let mut writer = PgzfWriter::with_config(std::io::Cursor::new(Vec::new()), config);
+//! let (start_block, block_count) = writer.write_with_pad(b"my data").unwrap();
+//! ```
+//!
+//! ## Block-Level Flags
+//!
+//! Attach a `u32` flag to blocks during writing and read them on the consumer side
+//! without decompressing:
+//!
+//! ```no_run
+//! use pgzf::{PgzfWriter, PgzfConfig};
+//! use std::io::Write;
+//!
+//! # let config = PgzfConfig::default();
+//! # let mut writer = PgzfWriter::with_config(std::io::Cursor::new(Vec::new()), config);
+//! writer.set_block_flag(42);
+//! writer.write_with_pad(b"tagged data").unwrap();
+//! ```
+//!
+//! On the reader side, scan flags or check the current block:
+//!
+//! ```no_run
+//! use pgzf::PgzfReader;
+//!
+//! # let mut reader: PgzfReader<std::io::Cursor<Vec<u8>>> = unimplemented!();
+//! // Fast scan without decompressing
+//! let flags = reader.scan_block_flags(None).unwrap();
+//!
+//! // Or check current block during sequential reading
+//! let flag = reader.current_block_flag();
+//! ```
+//!
+//! ## Raw Block Access
+//!
+//! Read raw gzip members without decompression for low-level inspection:
+//!
+//! ```no_run
+//! use pgzf::{PgzfReader, RawBlock};
+//!
+//! # let mut reader: PgzfReader<std::io::Cursor<Vec<u8>>> = unimplemented!();
+//! while let Some(RawBlock { block_index, block_type, flag, .. }) = reader.read_one_raw_block().unwrap() {
+//!     println!("block {block_index}: type={block_type:?}, flag={flag:?}");
+//! }
+//! ```
 
 mod compress;
 mod constants;

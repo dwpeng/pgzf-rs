@@ -10,8 +10,11 @@ A Rust implementation of [PGZF (Parallel GZip Format)](https://github.com/ruanju
 ## Features
 
 - **Parallel compression** -- blocks within a group are compressed concurrently via [rayon](https://github.com/rayon-rs/rayon)
-- **Parallel decompression** -- read-ahead buffer with batch parallel decompression
+- **Parallel decompression** -- read-ahead buffer with batch parallel decompression, configurable readahead size
 - **Random access** -- seek by byte offset or block index using the built-in index
+- **Block-level flags** -- attach `u32` flags to blocks for downstream identification
+- **Block-aligned writing** -- `write_with_pad` ensures data boundaries align to block boundaries
+- **Low-level raw block API** -- inspect or process raw gzip members without decompression
 - **GZIP compatible** -- every PGZF file is a valid sequence of gzip members; `gzip -d` can decompress it
 - **Streaming API** -- implements `std::io::Write` (compressor) and `std::io::Read` + `std::io::Seek` (decompressor)
 - **Auto-detection** -- reader automatically detects PGZF vs standard gzip files
@@ -20,7 +23,7 @@ A Rust implementation of [PGZF (Parallel GZip Format)](https://github.com/ruanju
 
 ```toml
 [dependencies]
-pgzf = "0.1"
+pgzf = "0.4"
 ```
 
 ## CLI Usage
@@ -167,6 +170,82 @@ let mut reader = PgzfReader::new(file).unwrap();
 
 // Read blocks 2-5 (4 blocks total)
 let data = reader.read_blocks(2, 4).unwrap();
+```
+
+### Block-Level Flags
+
+Attach a `u32` flag to blocks during writing, then read the flag on the consumer side.
+Useful for tagging data segments without parsing the decompressed content.
+
+```rust
+use pgzf::{PgzfWriter, PgzfReader, PgzfConfig};
+use std::io::{Write, Read, Cursor};
+
+let config = PgzfConfig::builder().block_size(256).build();
+let mut writer = PgzfWriter::with_config(Cursor::new(Vec::new()), config);
+
+// Each write_with_pad creates block-aligned data with the current flag
+writer.set_block_flag(1);
+writer.write_with_pad(b"segment one").unwrap();
+
+writer.set_block_flag(2);
+writer.write_with_pad(b"segment two").unwrap();
+
+let cursor = writer.finish().unwrap();
+let compressed = cursor.into_inner();
+
+// Read back and check flags
+let mut reader = PgzfReader::new(Cursor::new(&compressed)).unwrap();
+
+// Scan flags without decompressing (fast path)
+let flags = reader.scan_block_flags(None).unwrap();
+for (block_idx, flag) in &flags {
+    println!("block {block_idx}: flag={flag:?}");
+}
+
+// Or check the current block's flag during sequential reading
+reader.seek_to_block(0).unwrap();
+let mut buf = [0u8; 11];
+reader.read_exact(&mut buf).unwrap();
+assert_eq!(reader.current_block_flag(), Some(1));
+```
+
+### Raw Block Iteration
+
+Use `read_one_raw_block` to iterate over raw gzip members without decompression.
+Each block is returned as a `RawBlock` struct with the full gzip member, block type,
+flag, and block index.
+
+```rust
+use pgzf::{PgzfReader, RawBlock};
+
+let mut reader = PgzfReader::new(file).unwrap();
+while let Some(RawBlock { block_index, block_type, flag, raw, .. }) = reader.read_one_raw_block()? {
+    println!("block {block_index}: type={block_type:?}, flag={flag:?}, size={}", raw.len());
+}
+```
+
+### Configure Reader Threading
+
+Control the readahead batch size (number of blocks decompressed in parallel) and
+the global rayon thread pool:
+
+```rust
+use pgzf::PgzfReader;
+
+// Builder-style (consumes reader)
+let reader = PgzfReader::new(file)?.with_readahead(16);
+
+// Or mutate an existing reader
+let mut reader = PgzfReader::new(file)?;
+reader.set_readahead_size(16);
+println!("readahead: {}", reader.readahead_size());
+
+// Configure rayon global thread pool before creating readers
+rayon::ThreadPoolBuilder::new()
+    .num_threads(4)
+    .build_global()
+    .unwrap();
 ```
 
 ### Inspect Index
