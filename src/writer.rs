@@ -212,23 +212,26 @@ impl<W: Write + Seek> PgzfWriter<W> {
     ///
     /// Returns `(start_block, block_count)` — the index of the first block
     /// occupied by this data and the total number of blocks it spans.
+    ///
+    /// Unlike `finish()`, this method does not force a group flush. Pending
+    /// blocks are counted in the return value but remain buffered for later
+    /// bulk flushing.
     pub fn write_with_pad(&mut self, data: &[u8]) -> Result<(u64, u64)> {
         // Flush previously buffered data so new data starts in a fresh block
         self.buffer_block();
-        // Force-flush the group so counter state is accurate
-        self.flush_group()?;
 
-        let start_block = self.total_blocks;
+        // Total blocks so far (flushed + pending) = start of new data
+        let start_block = self.total_blocks + self.pending_blocks.len() as u64;
 
         // Write new data
         self.write_all(data)?;
 
         // Pad: flush any remaining buffered data as a block
-        self.pad_block();
-        // Force-flush the group so all blocks are counted
-        self.flush_group()?;
+        self.buffer_block();
 
-        Ok((start_block, self.total_blocks - start_block))
+        let block_count = (self.total_blocks + self.pending_blocks.len() as u64) - start_block;
+
+        Ok((start_block, block_count))
     }
 
     /// Set a flag value that will be embedded in subsequent blocks.
@@ -240,12 +243,6 @@ impl<W: Write + Seek> PgzfWriter<W> {
     /// Clear the block flag; subsequent blocks will have no flag.
     pub fn clear_block_flag(&mut self) {
         self.block_flag = None;
-    }
-
-    /// Ensure all buffered data is written to a block, so subsequent writes
-    /// will not share a block with data already written.
-    pub(crate) fn pad_block(&mut self) {
-        self.buffer_block();
     }
 
     pub fn finish(mut self) -> Result<W> {
@@ -659,6 +656,47 @@ mod tests {
             reader.current_block_flag(),
             None,
             "third chunk should have no flag"
+        );
+    }
+
+    #[test]
+    fn test_write_with_pad_gzip_compatible() {
+        use flate2::read::MultiGzDecoder;
+
+        let config = PgzfConfig::builder()
+            .block_size(256)
+            .group_blocks(10)
+            .build();
+
+        // write_with_pad 单次
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = PgzfWriter::with_config(cursor, config.clone());
+        writer.write_with_pad(b"hello from write_with_pad").unwrap();
+        let output = writer.finish().unwrap().into_inner();
+
+        let mut decoder = MultiGzDecoder::new(Cursor::new(&output));
+        let mut result = Vec::new();
+        decoder.read_to_end(&mut result).unwrap();
+        assert_eq!(
+            result, b"hello from write_with_pad",
+            "single write_with_pad should be gzip compatible"
+        );
+
+        // write_with_pad 多次
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = PgzfWriter::with_config(cursor, config);
+        writer.write_with_pad(b"first chunk ").unwrap();
+        writer.write_with_pad(b"second chunk").unwrap();
+        let output = writer.finish().unwrap().into_inner();
+
+        let mut decoder = MultiGzDecoder::new(Cursor::new(&output));
+        let mut result = Vec::new();
+        decoder.read_to_end(&mut result).unwrap();
+        assert_eq!(
+            result, b"first chunk second chunk",
+            "multiple write_with_pad should be gzip compatible"
         );
     }
 }
