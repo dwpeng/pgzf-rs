@@ -144,14 +144,6 @@ For each data block i (0..N-1):
 
 - **Present in**: IDX only
 
-### 5.4 FL -- Block Flag
-
-- **TAG**: `46 4C` ("FL")
-- **SLEN**: 4
-- **VALUE**: User-defined block flag, `u32` LE
-- **Present in**: BEG, DAT (optional)
-- **Purpose**: Downstream consumers can attach a tag to a block without needing to parse the decompressed data. The flag is preserved through compression/decompression and is visible to readers that support the FL tag. Standard GZIP readers ignore unknown extra-field tags.
-
 ---
 
 ## 6. Block Types
@@ -160,7 +152,6 @@ For each data block i (0..N-1):
 
 First block of each group.
 
-**Without FL tag:**
 ```
 Offset  Size  Content
 ------  ----  -------
@@ -176,29 +167,10 @@ Offset  Size  Content
 
 Header size: 32 bytes.
 
-**With optional FL tag:**
-```
-Offset  Size  Content
-------  ----  -------
-0       10    Fixed GZIP header (XFL=0xAA)
-10      2     XLEN = 28
-12      4     ZC tag: 'Z','C', SLEN=4
-16      4     ZC value: member size (u32 LE)
-20      8     GC tag: 'G','C', SLEN=8
-28      8     GC value: group size (u64 LE, lower 4 bytes backpatched later)
-32      6     FL tag: 'F','L', SLEN=4
-36      4     FL value: user-defined flag (u32 LE)
-40      ...   Deflate stream
-...     8     Trailer: CRC32 + ISIZE
-```
-
-Header size: 40 bytes (with FL tag).
-
 ### 6.2 DAT Block (Data)
 
 Regular data blocks within a group.
 
-**Without FL tag:**
 ```
 Offset  Size  Content
 ------  ----  -------
@@ -211,22 +183,6 @@ Offset  Size  Content
 ```
 
 Header size: 20 bytes.
-
-**With optional FL tag:**
-```
-Offset  Size  Content
-------  ----  -------
-0       10    Fixed GZIP header (XFL=0xAA)
-10      2     XLEN = 16
-12      4     ZC tag: 'Z','C', SLEN=4
-16      4     ZC value: member size (u32 LE)
-20      6     FL tag: 'F','L', SLEN=4
-24      4     FL value: user-defined flag (u32 LE)
-28      ...   Deflate stream
-...     8     Trailer: CRC32 + ISIZE
-```
-
-Header size: 28 bytes (with FL tag).
 
 ### 6.3 IDX Block (Index)
 
@@ -323,20 +279,11 @@ Given target data block index I (0-based, negative counts from end):
 
 ## 10. XLEN Summary
 
-| Block Type | XLEN (no FL) | XLEN (with FL) |
-|------------|-------------|----------------|
-| BEG | 20 | 28 |
-| DAT | 8 | 16 |
-| IDX | 12 + N*8 | N/A |
-
-Breakdown:
-- **BEG (no FL)**: ZC(8) + GC(12)
-- **BEG (with FL)**: ZC(8) + GC(12) + FL(8)
-- **DAT (no FL)**: ZC(8)
-- **DAT (with FL)**: ZC(8) + FL(8)
-- **IDX**: ZC(8) + IX tag header(4) + IX data(N*8)
-
-Where N = number of data blocks (BEG + DAT) in the group.
+| Block Type | XLEN | Breakdown |
+|------------|------|-----------|
+| BEG | 20 | ZC(8) + GC(12) |
+| DAT | 8 | ZC(8) |
+| IDX | 12 + N*8 | ZC(8) + IX tag header(4) + IX data(N*8) |
 
 Where N = number of data blocks (BEG + DAT) in the group.
 
@@ -349,7 +296,6 @@ Where N = number of data blocks (BEG + DAT) in the group.
 | ZC | `5A 43` | 4 | member size, u32 LE | BEG, DAT, IDX |
 | GC | `47 43` | 8 | group size, u64 LE (lower 4 backpatched) | BEG |
 | IX | `49 58` | N*8 | N * (compressed:u32, uncompressed:u32) LE | IDX |
-| FL | `46 4C` | 4 | user-defined block flag, u32 LE | BEG, DAT (optional) |
 
 ---
 
@@ -382,27 +328,4 @@ IDX block (no user data):
   [C1 C1 C1 C1] [U1 U1 U1 U1]                    ; block 1: comp_size, uncomp_size
   [... empty deflate ...]                          ; zero bytes
   [00 00 00 00] [00 00 00 00]                      ; CRC32=0, ISIZE=0
-```
-
-### 12.1 With Optional FL Tags
-
-The same group with FL tags on both data blocks:
-
-```
-BEG block (data block 0, flag=42):
-  [1f 8b] [08] [04] [00 00 00 00] [aa] [03]     ; fixed header
-  [1c 00]                                          ; XLEN = 28
-  [5a 43] [04 00] [ZZ ZZ ZZ ZZ]                   ; ZC: member size
-  [47 43] [08 00] [GG GG GG GG 00 00 00 00]       ; GC: group size (backpatched)
-  [46 4c] [04 00] [2a 00 00 00]                   ; FL: flag=42 (0x2a)
-  [... deflate ...]                                ; compressed data
-  [CC CC CC CC] [SS SS SS SS]                      ; CRC32, ISIZE
-
-DAT block (data block 1, flag=99):
-  [1f 8b] [08] [04] [00 00 00 00] [aa] [03]     ; fixed header
-  [10 00]                                          ; XLEN = 16
-  [5a 43] [04 00] [ZZ ZZ ZZ ZZ]                   ; ZC: member size
-  [46 4c] [04 00] [63 00 00 00]                   ; FL: flag=99 (0x63)
-  [... deflate ...]                                ; compressed data
-  [CC CC CC CC] [SS SS SS SS]                      ; CRC32, ISIZE
 ```

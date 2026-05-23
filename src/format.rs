@@ -71,7 +71,7 @@ pub(crate) fn is_pgzf_member(flg: u8, xfl: u8) -> bool {
 pub(crate) fn parse_extra_field(
     buf: &[u8],
     is_pgzf: bool,
-) -> Result<(u32, Option<u64>, Option<Vec<IndexEntry>>, Option<u32>)> {
+) -> Result<(u32, Option<u64>, Option<Vec<IndexEntry>>)> {
     if buf.len() < 2 {
         return Err(PgzfError::InvalidFormat("extra field too short".into()));
     }
@@ -88,10 +88,9 @@ pub(crate) fn parse_extra_field(
     let mut zc: u32 = 0;
     let mut gc: Option<u64> = None;
     let mut ix: Option<Vec<IndexEntry>> = None;
-    let mut fl: Option<u32> = None;
 
     if !is_pgzf {
-        return Ok((zc, gc, ix, fl));
+        return Ok((zc, gc, ix));
     }
 
     let mut off = 0;
@@ -119,14 +118,12 @@ pub(crate) fn parse_extra_field(
                 i += 8;
             }
             ix = Some(entries);
-        } else if tag == TAG_FL && slen >= 4 {
-            fl = Some(read_u32_le(data));
         }
 
         off += slen;
     }
 
-    Ok((zc, gc, ix, fl))
+    Ok((zc, gc, ix))
 }
 
 pub(crate) fn determine_block_type(gc: Option<u64>, ix: &Option<Vec<IndexEntry>>) -> BlockType {
@@ -168,28 +165,6 @@ pub(crate) fn build_beg_header(zc: u32) -> [u8; BEG_HEADER_SIZE] {
     buf
 }
 
-pub(crate) fn build_beg_header_with_flag(zc: u32, flag: u32) -> [u8; BEG_FLAG_HEADER_SIZE] {
-    let mut buf = [0u8; BEG_FLAG_HEADER_SIZE];
-    build_gzip_base(&mut buf);
-    write_u16_le(&mut buf[10..], 28); // XLEN = ZC(8) + GC(12) + FL(8)
-    // ZC tag
-    buf[12] = TAG_ZC[0];
-    buf[13] = TAG_ZC[1];
-    write_u16_le(&mut buf[14..], 4);
-    write_u32_le(&mut buf[16..], zc);
-    // GC tag
-    buf[20] = TAG_GC[0];
-    buf[21] = TAG_GC[1];
-    write_u16_le(&mut buf[22..], 8);
-    write_u64_le(&mut buf[24..], 0); // placeholder, backpatched later
-    // FL tag
-    buf[32] = TAG_FL[0];
-    buf[33] = TAG_FL[1];
-    write_u16_le(&mut buf[34..], 4);
-    write_u32_le(&mut buf[36..], flag);
-    buf
-}
-
 pub(crate) fn build_dat_header(zc: u32) -> [u8; DAT_HEADER_SIZE] {
     let mut buf = [0u8; DAT_HEADER_SIZE];
     build_gzip_base(&mut buf);
@@ -199,23 +174,6 @@ pub(crate) fn build_dat_header(zc: u32) -> [u8; DAT_HEADER_SIZE] {
     buf[13] = TAG_ZC[1];
     write_u16_le(&mut buf[14..], 4);
     write_u32_le(&mut buf[16..], zc);
-    buf
-}
-
-pub(crate) fn build_dat_header_with_flag(zc: u32, flag: u32) -> [u8; DAT_FLAG_HEADER_SIZE] {
-    let mut buf = [0u8; DAT_FLAG_HEADER_SIZE];
-    build_gzip_base(&mut buf);
-    write_u16_le(&mut buf[10..], 16); // XLEN = ZC(8) + FL(8)
-    // ZC tag
-    buf[12] = TAG_ZC[0];
-    buf[13] = TAG_ZC[1];
-    write_u16_le(&mut buf[14..], 4);
-    write_u32_le(&mut buf[16..], zc);
-    // FL tag
-    buf[20] = TAG_FL[0];
-    buf[21] = TAG_FL[1];
-    write_u16_le(&mut buf[22..], 4);
-    write_u32_le(&mut buf[24..], flag);
     buf
 }
 
@@ -393,7 +351,7 @@ mod tests {
         // The header starts at offset 10 for XLEN
         let xlen = read_u16_le(&header[10..]) as usize;
         let extra = &header[10..10 + 2 + xlen];
-        let (zc, gc, ix, _fl) = parse_extra_field(extra, true).unwrap();
+        let (zc, gc, ix) = parse_extra_field(extra, true).unwrap();
         assert_eq!(zc, 500);
         assert!(gc.is_none());
         let ix = ix.unwrap();

@@ -12,8 +12,6 @@ A Rust implementation of [PGZF (Parallel GZip Format)](https://github.com/ruanju
 - **Parallel compression** -- blocks within a group are compressed concurrently via [rayon](https://github.com/rayon-rs/rayon)
 - **Parallel decompression** -- read-ahead buffer with batch parallel decompression, configurable readahead size
 - **Random access** -- seek by byte offset or block index using the built-in index
-- **Block-level flags** -- attach `u32` flags to blocks for downstream identification
-- **Block-aligned writing** -- `write_with_pad` ensures data boundaries align to block boundaries
 - **Low-level raw block API** -- inspect or process raw gzip members without decompression
 - **GZIP compatible** -- every PGZF file is a valid sequence of gzip members; `gzip -d` can decompress it
 - **Streaming API** -- implements `std::io::Write` (compressor) and `std::io::Read` + `std::io::Seek` (decompressor)
@@ -95,36 +93,6 @@ let cursor = writer.finish().unwrap();
 let compressed = cursor.into_inner();
 ```
 
-### Block-Aligned Writing
-
-Use `write_with_pad` to write data on block-aligned boundaries. It flushes any buffered data,
-writes the input, and pads to a block boundary, returning the starting block index and block count
-for the written data.
-
-```rust
-use pgzf::{PgzfWriter, PgzfConfig, PgzfReader};
-use std::io::{Write, Read, Cursor};
-
-let config = PgzfConfig::builder()
-    .block_size(256)
-    .group_blocks(100)
-    .build();
-
-let mut writer = PgzfWriter::with_config(Cursor::new(Vec::new()), config);
-
-// Write two chunks, each starting at a fresh block boundary
-let (blk1, cnt1) = writer.write_with_pad(b"chunk one data").unwrap();
-let (blk2, cnt2) = writer.write_with_pad(b"chunk two data").unwrap();
-
-let cursor = writer.finish().unwrap();
-let compressed = cursor.into_inner();
-
-// Read back chunk one by its block range
-let mut reader = PgzfReader::new(Cursor::new(&compressed)).unwrap();
-let data = reader.read_blocks(blk1 as usize, cnt1 as usize).unwrap();
-assert_eq!(&data, b"chunk one data");
-```
-
 ### Decompress
 
 ```rust
@@ -172,56 +140,18 @@ let mut reader = PgzfReader::new(file).unwrap();
 let data = reader.read_blocks(2, 4).unwrap();
 ```
 
-### Block-Level Flags
-
-Attach a `u32` flag to blocks during writing, then read the flag on the consumer side.
-Useful for tagging data segments without parsing the decompressed content.
-
-```rust
-use pgzf::{PgzfWriter, PgzfReader, PgzfConfig};
-use std::io::{Write, Read, Cursor};
-
-let config = PgzfConfig::builder().block_size(256).build();
-let mut writer = PgzfWriter::with_config(Cursor::new(Vec::new()), config);
-
-// Each write_with_pad creates block-aligned data with the current flag
-writer.set_block_flag(1);
-writer.write_with_pad(b"segment one").unwrap();
-
-writer.set_block_flag(2);
-writer.write_with_pad(b"segment two").unwrap();
-
-let cursor = writer.finish().unwrap();
-let compressed = cursor.into_inner();
-
-// Read back and check flags
-let mut reader = PgzfReader::new(Cursor::new(&compressed)).unwrap();
-
-// Scan flags without decompressing (fast path)
-let flags = reader.scan_block_flags(None).unwrap();
-for (block_idx, flag) in &flags {
-    println!("block {block_idx}: flag={flag:?}");
-}
-
-// Or check the current block's flag during sequential reading
-reader.seek_to_block(0).unwrap();
-let mut buf = [0u8; 11];
-reader.read_exact(&mut buf).unwrap();
-assert_eq!(reader.current_block_flag(), Some(1));
-```
-
 ### Raw Block Iteration
 
 Use `read_one_raw_block` to iterate over raw gzip members without decompression.
 Each block is returned as a `RawBlock` struct with the full gzip member, block type,
-flag, and block index.
+and block index.
 
 ```rust
 use pgzf::{PgzfReader, RawBlock};
 
 let mut reader = PgzfReader::new(file).unwrap();
-while let Some(RawBlock { block_index, block_type, flag, raw, .. }) = reader.read_one_raw_block()? {
-    println!("block {block_index}: type={block_type:?}, flag={flag:?}, size={}", raw.len());
+while let Some(RawBlock { block_index, block_type, raw, .. }) = reader.read_one_raw_block()? {
+    println!("block {block_index}: type={block_type:?}, size={}", raw.len());
 }
 ```
 
