@@ -1,12 +1,14 @@
 use std::{
     collections::VecDeque,
     io::{Read, Seek, SeekFrom},
+    sync::Arc,
 };
 
 use rayon::prelude::*;
 
 use crate::{
     BlockType,
+    block_cache::BlockCache,
     constants::*,
     error::{PgzfError, Result},
     format::{is_pgzf_member, read_u32_le, validate_gzip_header},
@@ -14,9 +16,10 @@ use crate::{
 };
 
 const DEFAULT_READAHEAD: usize = 8;
+const DEFAULT_BLOCK_CACHE_CAPACITY: usize = 64;
 
 struct BufferedBlock {
-    data: Vec<u8>,
+    data: Arc<[u8]>,
 }
 
 pub struct RawBlock {
@@ -30,13 +33,14 @@ pub struct PgzfReader<R: Read + Seek> {
     inner: R,
     is_pgzf: bool,
     index: Option<PgzfIndex>,
-    current_block: Vec<u8>,
+    current_block: Arc<[u8]>,
     current_pos: usize,
     eof: bool,
     pending_seek: Option<u64>,
     readahead: VecDeque<BufferedBlock>,
     readahead_size: usize,
     next_block_index: usize,
+    block_cache: BlockCache,
 }
 
 impl<R: Read + Seek> PgzfReader<R> {
@@ -60,13 +64,14 @@ impl<R: Read + Seek> PgzfReader<R> {
             inner,
             is_pgzf,
             index,
-            current_block: Vec::new(),
+            current_block: Arc::from([]),
             current_pos: 0,
             eof: false,
             pending_seek: None,
             readahead: VecDeque::new(),
             readahead_size: DEFAULT_READAHEAD,
             next_block_index: 0,
+            block_cache: BlockCache::new(DEFAULT_BLOCK_CACHE_CAPACITY),
         })
     }
 
@@ -119,13 +124,38 @@ impl<R: Read + Seek> PgzfReader<R> {
         self.readahead_size = n.max(1);
     }
 
+    /// Set the block cache capacity (number of decompressed blocks to retain).
+    ///
+    /// The cache survives seeks, so repeated access to the same blocks avoids
+    /// re-reading and re-decompressing from disk. Setting to 0 disables caching.
+    /// The default capacity is 64 blocks.
+    pub fn with_block_cache(mut self, capacity: usize) -> Self {
+        self.block_cache = BlockCache::new(capacity);
+        self
+    }
+
+    /// Change the block cache capacity at runtime.
+    pub fn set_block_cache_capacity(&mut self, n: usize) {
+        self.block_cache = BlockCache::new(n);
+    }
+
+    /// Returns the current block cache capacity.
+    pub fn block_cache_capacity(&self) -> usize {
+        self.block_cache.capacity()
+    }
+
+    /// Returns the number of blocks currently cached.
+    pub fn block_cache_len(&self) -> usize {
+        self.block_cache.len()
+    }
+
     pub fn seek_to_byte(&mut self, offset: u64) -> Result<()> {
         if !self.is_pgzf {
             return Err(PgzfError::IndexNotAvailable);
         }
         self.pending_seek = Some(offset);
         self.next_block_index = 0;
-        self.current_block.clear();
+        self.current_block = Arc::from([]);
         self.current_pos = 0;
         self.readahead.clear();
         Ok(())
@@ -139,7 +169,7 @@ impl<R: Read + Seek> PgzfReader<R> {
         let compressed_offset = index.seek_block(block_index)?;
         self.inner.seek(SeekFrom::Start(compressed_offset))?;
         self.next_block_index = 0;
-        self.current_block.clear();
+        self.current_block = Arc::from([]);
         self.current_pos = 0;
         self.eof = false;
         self.pending_seek = None;
@@ -219,7 +249,7 @@ impl<R: Read + Seek> PgzfReader<R> {
         }
 
         // Reset reader state — file position has moved
-        self.current_block.clear();
+        self.current_block = Arc::from([]);
         self.current_pos = 0;
         self.eof = false;
         self.pending_seek = None;
@@ -237,24 +267,37 @@ impl<R: Read + Seek> PgzfReader<R> {
                 .seek_byte(target_byte)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
-            let compressed_offset = index.compressed_offset(block_idx).ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "block not found")
-            })?;
-
-            self.inner.seek(SeekFrom::Start(compressed_offset))?;
-            self.next_block_index = block_idx;
-            self.current_block.clear();
+            self.current_block = Arc::from([]);
             self.current_pos = 0;
             self.eof = false;
             self.readahead.clear();
 
-            self.fill_readahead()?;
-
-            if let Some(buf) = self.readahead.pop_front() {
-                self.current_block = buf.data;
+            // Check if target block is already cached
+            if let Some(cached) = self.block_cache.get(block_idx) {
+                self.current_block = cached;
                 self.current_pos = skip as usize;
+                // Position file cursor at the next block for subsequent reads
+                let next_offset = index
+                    .compressed_offset(block_idx + 1)
+                    .unwrap_or_else(|| index.total_compressed());
+                self.inner.seek(SeekFrom::Start(next_offset))?;
+                self.next_block_index = block_idx + 1;
             } else {
-                self.eof = true;
+                // Cache miss — seek to block and fill readahead normally
+                let compressed_offset = index.compressed_offset(block_idx).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "block not found")
+                })?;
+                self.inner.seek(SeekFrom::Start(compressed_offset))?;
+                self.next_block_index = block_idx;
+
+                self.fill_readahead()?;
+
+                if let Some(buf) = self.readahead.pop_front() {
+                    self.current_block = buf.data;
+                    self.current_pos = skip as usize;
+                } else {
+                    self.eof = true;
+                }
             }
         }
         Ok(())
@@ -398,70 +441,176 @@ impl<R: Read + Seek> PgzfReader<R> {
     }
 
     /// Fill the readahead buffer by reading sequential raw blocks then decompressing in parallel.
+    /// Cached blocks are skipped at the I/O level — only non-cached blocks are read from disk.
     fn fill_readahead(&mut self) -> std::io::Result<()> {
         if !self.is_pgzf {
             return Ok(());
         }
 
-        // Don't refill if readahead still has data
         if !self.readahead.is_empty() {
             return Ok(());
         }
 
-        // Read raw blocks sequentially from current file position
-        let mut raw_batch: Vec<(Vec<u8>, usize)> = Vec::new();
-        let mut data_blocks_read = 0;
-        let batch_limit = self.readahead_size;
-        let mut hit_eof = false;
+        // Extract all metadata from index in a scoped block to release the borrow
+        // before any mutable self operations.
+        let (total_blocks, start, end, ranges_with_offsets, last_end_offset) = {
+            let index = match self.index.as_ref() {
+                Some(idx) => idx,
+                None => return Ok(()),
+            };
+            let total_blocks = index.block_count();
+            let start = self.next_block_index;
+            let batch_limit = self.readahead_size;
 
-        while data_blocks_read < batch_limit {
-            match self.read_one_raw_block() {
-                Ok(Some(RawBlock {
-                    raw,
-                    header_size,
-                    block_type,
-                    ..
-                })) => {
-                    if block_type == BlockType::Idx {
-                        continue;
-                    }
-                    raw_batch.push((raw, header_size));
-                    data_blocks_read += 1;
+            if start >= total_blocks {
+                self.eof = true;
+                return Ok(());
+            }
+
+            let end = total_blocks.min(start + batch_limit);
+
+            // Phase 1: check cache, collect non-cached block indices
+            let mut non_cached: Vec<usize> = Vec::new();
+            for block_idx in start..end {
+                if self.block_cache.get(block_idx).is_none() {
+                    non_cached.push(block_idx);
                 }
-                Ok(None) => {
-                    hit_eof = true;
+            }
+
+            // Group non-cached blocks into contiguous ranges and pre-compute offsets
+            let ranges = Self::group_contiguous(&non_cached);
+            let ranges_with_offsets: Vec<(std::ops::Range<usize>, u64)> = ranges
+                .iter()
+                .map(|r| {
+                    let offset = index.compressed_offset(r.start).unwrap_or(0);
+                    (r.clone(), offset)
+                })
+                .collect();
+
+            let last_end = ranges.last().map(|r| r.end).unwrap_or(start);
+            let last_end_offset = index
+                .compressed_offset(last_end)
+                .unwrap_or_else(|| index.total_compressed());
+
+            (total_blocks, start, end, ranges_with_offsets, last_end_offset)
+        };
+        // `index` borrow is dropped here — safe to mutate self
+
+        let count = end - start;
+
+        // Build results vector: cached blocks filled, non-cached left as None
+        let mut results: Vec<Option<Arc<[u8]>>> = Vec::with_capacity(count);
+        for block_idx in start..end {
+            if let Some(cached) = self.block_cache.get(block_idx) {
+                results.push(Some(cached));
+            } else {
+                results.push(None);
+            }
+        }
+
+        // Phase 2: read and decompress only non-cached blocks
+        let hit_eof = if !ranges_with_offsets.is_empty() {
+            let mut all_raw: Vec<(usize, Vec<u8>, usize)> = Vec::new();
+            let mut eof = false;
+
+            for (range, offset) in &ranges_with_offsets {
+                self.inner.seek(SeekFrom::Start(*offset))?;
+                self.next_block_index = range.start;
+
+                let range_len = range.end - range.start;
+                let mut blocks_read = 0;
+
+                while blocks_read < range_len {
+                    match self.read_one_raw_block() {
+                        Ok(Some(RawBlock {
+                            raw,
+                            header_size,
+                            block_type,
+                            ..
+                        })) => {
+                            if block_type == BlockType::Idx {
+                                continue;
+                            }
+                            let block_idx = self.next_block_index - 1;
+                            all_raw.push((block_idx, raw, header_size));
+                            blocks_read += 1;
+                        }
+                        Ok(None) => {
+                            eof = true;
+                            break;
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+
+                if eof {
                     break;
                 }
-                Err(e) => return Err(e.into()),
+            }
+
+            // Decompress in parallel
+            if !all_raw.is_empty() {
+                let decompressed: Vec<(usize, Vec<u8>)> = all_raw
+                    .par_iter()
+                    .map(|(block_idx, raw, header_size)| {
+                        let data = Self::decompress_raw_block(raw, *header_size)?;
+                        Ok::<_, std::io::Error>((*block_idx, data))
+                    })
+                    .collect::<std::io::Result<Vec<_>>>()?;
+
+                for (block_idx, data) in decompressed {
+                    let arc_data: Arc<[u8]> = Arc::from(data);
+                    self.block_cache.insert(block_idx, Arc::clone(&arc_data));
+                    results[block_idx - start] = Some(arc_data);
+                }
+            }
+
+            // Restore file position for sequential continuation
+            self.inner.seek(SeekFrom::Start(last_end_offset))?;
+            self.next_block_index = ranges_with_offsets.last().map(|(r, _)| r.end).unwrap_or(start);
+
+            eof
+        } else {
+            // All cached — advance state
+            self.next_block_index = end;
+            false
+        };
+
+        // Phase 3: assemble readahead from results
+        for data in results.into_iter().flatten() {
+            if !data.is_empty() {
+                self.readahead.push_back(BufferedBlock { data });
             }
         }
 
-        if raw_batch.is_empty() {
-            self.eof = true;
-            return Ok(());
-        }
-
-        // Decompress all blocks in parallel
-        let decompressed: Vec<BufferedBlock> = raw_batch
-            .par_iter()
-            .map(|(raw, header_size)| {
-                let data = Self::decompress_raw_block(raw, *header_size)?;
-                Ok::<_, std::io::Error>(BufferedBlock { data })
-            })
-            .collect::<std::io::Result<Vec<_>>>()?;
-
-        for block in decompressed {
-            if !block.data.is_empty() {
-                self.readahead.push_back(block);
-            }
-        }
-
-        // Only set EOF if we hit end of file AND have no buffered data
-        if hit_eof && self.readahead.is_empty() {
+        if self.readahead.is_empty() && (hit_eof || end >= total_blocks) {
             self.eof = true;
         }
 
         Ok(())
+    }
+
+    /// Group block indices into contiguous ranges for sequential I/O.
+    /// E.g. [0, 1, 2, 5, 6, 9] → [0..3, 5..7, 9..10]
+    fn group_contiguous(indices: &[usize]) -> Vec<std::ops::Range<usize>> {
+        if indices.is_empty() {
+            return Vec::new();
+        }
+        let mut ranges = Vec::new();
+        let mut start = indices[0];
+        let mut prev = indices[0];
+
+        for &idx in &indices[1..] {
+            if idx == prev + 1 {
+                prev = idx;
+            } else {
+                ranges.push(start..prev + 1);
+                start = idx;
+                prev = idx;
+            }
+        }
+        ranges.push(start..prev + 1);
+        ranges
     }
 
     fn advance_to_next_block_sequential(&mut self) -> std::io::Result<()> {
@@ -475,7 +624,7 @@ impl<R: Read + Seek> PgzfReader<R> {
                         self.eof = true;
                         return Ok(());
                     }
-                    self.current_block = data;
+                    self.current_block = Arc::from(data);
                     self.current_pos = 0;
                     return Ok(());
                 }
@@ -578,7 +727,7 @@ impl<R: Read + Seek> Seek for PgzfReader<R> {
 
         self.pending_seek = Some(target);
         self.next_block_index = 0;
-        self.current_block.clear();
+        self.current_block = Arc::from([]);
         self.current_pos = 0;
         self.readahead.clear();
         Ok(target)
@@ -795,5 +944,130 @@ mod tests {
         let mut output = Vec::new();
         reader.read_to_end(&mut output).unwrap();
         assert_eq!(output.len(), block_size * 20);
+    }
+
+    #[test]
+    fn test_block_cache_builder() {
+        let block_size = 64;
+        let original = vec![0x42u8; block_size * 3];
+        let pgzf_data = create_pgzf_data(&original, block_size);
+
+        let reader = PgzfReader::new(Cursor::new(&pgzf_data))
+            .unwrap()
+            .with_block_cache(32);
+        assert_eq!(reader.block_cache_capacity(), 32);
+        assert_eq!(reader.block_cache_len(), 0);
+    }
+
+    #[test]
+    fn test_block_cache_default_enabled() {
+        let block_size = 64;
+        let original = vec![0x42u8; block_size * 3];
+        let pgzf_data = create_pgzf_data(&original, block_size);
+
+        let reader = PgzfReader::new(Cursor::new(&pgzf_data)).unwrap();
+        assert_eq!(reader.block_cache_capacity(), 64);
+    }
+
+    #[test]
+    fn test_block_cache_populated_after_read() {
+        let block_size = 64;
+        let num_blocks = 5;
+        let original: Vec<u8> = (0..num_blocks)
+            .flat_map(|i| vec![i as u8; block_size])
+            .collect();
+        let pgzf_data = create_pgzf_data(&original, block_size);
+        let cursor = Cursor::new(pgzf_data);
+        let mut reader = PgzfReader::new(cursor).unwrap();
+
+        // Read all blocks
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        assert_eq!(output, original);
+
+        // Cache should have been populated
+        assert!(reader.block_cache_len() > 0);
+    }
+
+    #[test]
+    fn test_block_cache_survives_seek() {
+        let block_size = 64;
+        let num_blocks = 10;
+        let original: Vec<u8> = (0..num_blocks)
+            .flat_map(|i| vec![i as u8; block_size])
+            .collect();
+        let pgzf_data = create_pgzf_data(&original, block_size);
+        let cursor = Cursor::new(pgzf_data);
+        let mut reader = PgzfReader::new(cursor).unwrap();
+
+        // Read first few blocks to populate cache
+        let mut buf = vec![0u8; block_size * 3];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, original[..block_size * 3]);
+        let cache_len_before = reader.block_cache_len();
+        assert!(cache_len_before > 0);
+
+        // Seek to a different position
+        reader.seek_to_byte(0).unwrap();
+
+        // Cache should survive the seek
+        assert_eq!(reader.block_cache_len(), cache_len_before);
+
+        // Re-read should still work correctly
+        let mut buf2 = vec![0u8; block_size * 3];
+        reader.read_exact(&mut buf2).unwrap();
+        assert_eq!(buf2, original[..block_size * 3]);
+    }
+
+    #[test]
+    fn test_block_cache_hit_on_reseek() {
+        let block_size = 64;
+        let num_blocks = 10;
+        let original: Vec<u8> = (0..num_blocks)
+            .flat_map(|i| vec![i as u8; block_size])
+            .collect();
+        let pgzf_data = create_pgzf_data(&original, block_size);
+        let cursor = Cursor::new(pgzf_data);
+        let mut reader = PgzfReader::new(cursor).unwrap();
+
+        // Read all blocks to fill cache
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        assert_eq!(output, original);
+        let cache_after_read = reader.block_cache_len();
+        assert!(cache_after_read > 0);
+
+        // Seek back to beginning
+        reader.seek_to_byte(0).unwrap();
+
+        // Cache should still have entries (not cleared by seek)
+        assert_eq!(reader.block_cache_len(), cache_after_read);
+
+        // Read again - should serve from cache
+        let mut output2 = Vec::new();
+        reader.read_to_end(&mut output2).unwrap();
+        assert_eq!(output2, original);
+    }
+
+    #[test]
+    fn test_block_cache_disable() {
+        let block_size = 64;
+        let num_blocks = 5;
+        let original: Vec<u8> = (0..num_blocks)
+            .flat_map(|i| vec![i as u8; block_size])
+            .collect();
+        let pgzf_data = create_pgzf_data(&original, block_size);
+        let cursor = Cursor::new(pgzf_data);
+        let mut reader = PgzfReader::new(cursor).unwrap();
+
+        // Disable cache
+        reader.set_block_cache_capacity(0);
+        assert_eq!(reader.block_cache_capacity(), 0);
+
+        // Should still read correctly
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        assert_eq!(output, original);
+        assert_eq!(reader.block_cache_len(), 0);
     }
 }

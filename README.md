@@ -11,6 +11,7 @@ A Rust implementation of [PGZF (Parallel GZip Format)](https://github.com/ruanju
 
 - **Parallel compression** -- blocks within a group are compressed concurrently via [rayon](https://github.com/rayon-rs/rayon)
 - **Parallel decompression** -- read-ahead buffer with batch parallel decompression, configurable readahead size
+- **Block cache** -- LRU cache for decompressed blocks, survives seeks to avoid redundant I/O and decompression
 - **Random access** -- seek by byte offset or block index using the built-in index
 - **Low-level raw block API** -- inspect or process raw gzip members without decompression
 - **GZIP compatible** -- every PGZF file is a valid sequence of gzip members; `gzip -d` can decompress it
@@ -21,7 +22,7 @@ A Rust implementation of [PGZF (Parallel GZip Format)](https://github.com/ruanju
 
 ```toml
 [dependencies]
-pgzf = "0.4"
+pgzf = "0.7"
 ```
 
 ## CLI Usage
@@ -177,6 +178,40 @@ rayon::ThreadPoolBuilder::new()
     .build_global()
     .unwrap();
 ```
+
+### Block Cache
+
+The reader maintains an LRU cache of decompressed blocks that survives seeks.
+This avoids redundant I/O and decompression when seeking back to previously
+accessed positions. The cache is enabled by default with a capacity of 64 blocks.
+
+```rust
+use pgzf::PgzfReader;
+
+// Default cache (64 blocks)
+let reader = PgzfReader::new(file)?;
+
+// Custom cache capacity
+let reader = PgzfReader::new(file)?.with_block_cache(256);
+
+// Disable cache
+let reader = PgzfReader::new(file)?.with_block_cache(0);
+
+// Runtime control
+let mut reader = PgzfReader::new(file)?;
+reader.set_block_cache_capacity(128);
+println!("cache capacity: {}", reader.block_cache_capacity());
+println!("cached blocks: {}", reader.block_cache_len());
+```
+
+Cache performance characteristics:
+
+| Access pattern | Speedup |
+|---|---|
+| Repeated seek to same block | ~460x |
+| Random seek (cache fits working set) | ~2x |
+| Random seek (working set > cache) | ~1.1-1.5x |
+| Sequential read | No overhead |
 
 ### Inspect Index
 

@@ -62,7 +62,25 @@
 //!     println!("block {block_index}: type={block_type:?}");
 //! }
 //! ```
+//!
+//! ## Block Cache
+//!
+//! The reader caches decompressed blocks with an LRU eviction policy. The cache
+//! survives seeks, so repeated access to the same blocks avoids redundant I/O
+//! and decompression. Enabled by default (64 blocks):
+//!
+//! ```no_run
+//! use pgzf::PgzfReader;
+//!
+//! # let file: std::io::Cursor<Vec<u8>> = unimplemented!();
+//! // Custom capacity
+//! let reader = PgzfReader::new(file).unwrap().with_block_cache(256);
+//!
+//! // Disable
+//! let reader = PgzfReader::new(file).unwrap().with_block_cache(0);
+//! ```
 
+mod block_cache;
 mod compress;
 mod constants;
 mod decompress;
