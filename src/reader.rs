@@ -18,10 +18,6 @@ use crate::{
 const DEFAULT_READAHEAD: usize = 8;
 const DEFAULT_BLOCK_CACHE_CAPACITY: usize = 64;
 
-struct BufferedBlock {
-    data: Arc<[u8]>,
-}
-
 pub struct RawBlock {
     pub raw: Vec<u8>,
     pub header_size: usize,
@@ -37,7 +33,7 @@ pub struct PgzfReader<R: Read + Seek> {
     current_pos: usize,
     eof: bool,
     pending_seek: Option<u64>,
-    readahead: VecDeque<BufferedBlock>,
+    readahead: VecDeque<Arc<[u8]>>,
     readahead_size: usize,
     next_block_index: usize,
     block_cache: BlockCache,
@@ -293,7 +289,7 @@ impl<R: Read + Seek> PgzfReader<R> {
                 self.fill_readahead()?;
 
                 if let Some(buf) = self.readahead.pop_front() {
-                    self.current_block = buf.data;
+                    self.current_block = buf;
                     self.current_pos = skip as usize;
                 } else {
                     self.eof = true;
@@ -578,9 +574,7 @@ impl<R: Read + Seek> PgzfReader<R> {
 
         // Phase 3: assemble readahead from results
         for data in results.into_iter().flatten() {
-            if !data.is_empty() {
-                self.readahead.push_back(BufferedBlock { data });
-            }
+            self.readahead.push_back(data);
         }
 
         if self.readahead.is_empty() && (hit_eof || end >= total_blocks) {
@@ -660,26 +654,19 @@ impl<R: Read + Seek> Read for PgzfReader<R> {
         }
 
         if self.is_pgzf {
-            // Serve from readahead buffer
-            if let Some(next) = self.readahead.pop_front() {
-                self.current_block = next.data;
-                self.current_pos = 0;
-                let take = self.current_block.len().min(buf.len());
-                buf[..take].copy_from_slice(&self.current_block[..take]);
-                self.current_pos = take;
-                return Ok(take);
-            }
-
-            // Readahead empty, fill it
-            self.fill_readahead()?;
-
-            if let Some(next) = self.readahead.pop_front() {
-                self.current_block = next.data;
-                self.current_pos = 0;
-                let take = self.current_block.len().min(buf.len());
-                buf[..take].copy_from_slice(&self.current_block[..take]);
-                self.current_pos = take;
-                return Ok(take);
+            // Try readahead, refill once if empty
+            for attempt in 0..2 {
+                if attempt == 1 {
+                    self.fill_readahead()?;
+                }
+                if let Some(next) = self.readahead.pop_front() {
+                    self.current_block = next;
+                    self.current_pos = 0;
+                    let take = self.current_block.len().min(buf.len());
+                    buf[..take].copy_from_slice(&self.current_block[..take]);
+                    self.current_pos = take;
+                    return Ok(take);
+                }
             }
 
             self.eof = true;

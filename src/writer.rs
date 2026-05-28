@@ -169,14 +169,14 @@ impl<W: Write + Seek> PgzfWriter<W> {
 
         self.total_compressed += idx_zc as u64;
 
-        // Backpatch GC value in BEG header
+        // Backpatch GC value in BEG header (u64 field)
         if self.gc_pending {
-            let gc_value: u32 = block_entries.iter().map(|e| e.compressed_size).sum();
+            let gc_value: u64 = block_entries.iter().map(|e| e.compressed_size as u64).sum();
             let gc_file_offset = self.group_start_offset + GC_VALUE_OFFSET as u64;
             let current_pos = w.stream_position()?;
             w.seek(SeekFrom::Start(gc_file_offset))?;
-            let mut gc_buf = [0u8; 4];
-            format::write_u32_le(&mut gc_buf, gc_value);
+            let mut gc_buf = [0u8; 8];
+            format::write_u64_le(&mut gc_buf, gc_value);
             w.write_all(&gc_buf)?;
             w.seek(SeekFrom::Start(current_pos))?;
             self.gc_pending = false;
