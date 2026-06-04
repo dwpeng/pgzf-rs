@@ -82,10 +82,7 @@ impl<W: Write + Seek> PgzfWriter<W> {
         // Move data out of the reusable buffer without copying.
         // truncate() only adjusts the length — no memcpy, no dealloc.
         // Allocate a new reusable buffer (same capacity as before).
-        let mut data = std::mem::replace(
-            &mut self.buffer,
-            vec![0u8; self.config.block_size],
-        );
+        let mut data = std::mem::replace(&mut self.buffer, vec![0u8; self.config.block_size]);
         data.truncate(self.buffer_len);
         self.pending_blocks.push(PendingBlock { data, block_type });
 
@@ -153,7 +150,9 @@ impl<W: Write + Seek> PgzfWriter<W> {
                 .par_iter()
                 .map_init(
                     || ReusableCompressor::new(level),
-                    |compressor, block| Self::compress_single_block(compressor, &block.data, block.block_type),
+                    |compressor, block| {
+                        Self::compress_single_block(compressor, &block.data, block.block_type)
+                    },
                 )
                 .collect::<Result<Vec<_>>>()?;
 
@@ -446,16 +445,14 @@ mod tests {
         let config = PgzfConfig::builder()
             .block_size(block_size)
             .group_blocks(10)
-            .compression_batch_size(3)  // Small batch size
+            .compression_batch_size(3) // Small batch size
             .build();
 
         let buf = Vec::new();
         let cursor = Cursor::new(buf);
         let mut writer = PgzfWriter::with_config(cursor, config);
 
-        let original: Vec<u8> = (0..10)
-            .flat_map(|i| vec![i as u8; block_size])
-            .collect();
+        let original: Vec<u8> = (0..10).flat_map(|i| vec![i as u8; block_size]).collect();
         writer.write_all(&original).unwrap();
         let cursor = writer.finish().unwrap();
         let pgzf_data = cursor.into_inner();
@@ -481,9 +478,7 @@ mod tests {
         let cursor = Cursor::new(buf);
         let mut writer = PgzfWriter::with_config(cursor, config);
 
-        let original: Vec<u8> = (0..10)
-            .flat_map(|i| vec![i as u8; block_size])
-            .collect();
+        let original: Vec<u8> = (0..10).flat_map(|i| vec![i as u8; block_size]).collect();
         writer.write_all(&original).unwrap();
         let cursor = writer.finish().unwrap();
         let pgzf_data = cursor.into_inner();

@@ -1,6 +1,7 @@
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use pgzf::{PgzfConfig, PgzfReader, PgzfWriter};
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
 /// Generate deterministic data with a repeating pattern.
 fn generate_pattern_data(size: usize) -> Vec<u8> {
@@ -71,8 +72,9 @@ fn bench_random_seek(c: &mut Criterion) {
             &(&pgzf, &targets),
             |b, &(pgzf, targets)| {
                 b.iter(|| {
-                    let mut reader =
-                        PgzfReader::new(Cursor::new(pgzf)).unwrap().with_block_cache(64);
+                    let mut reader = PgzfReader::new(Cursor::new(pgzf))
+                        .unwrap()
+                        .with_block_cache(64);
                     let mut buf = vec![0u8; 1024];
                     for &offset in targets {
                         reader.seek(SeekFrom::Start(offset)).unwrap();
@@ -89,8 +91,9 @@ fn bench_random_seek(c: &mut Criterion) {
             &(&pgzf, &targets),
             |b, &(pgzf, targets)| {
                 b.iter(|| {
-                    let mut reader =
-                        PgzfReader::new(Cursor::new(pgzf)).unwrap().with_block_cache(0);
+                    let mut reader = PgzfReader::new(Cursor::new(pgzf))
+                        .unwrap()
+                        .with_block_cache(0);
                     let mut buf = vec![0u8; 1024];
                     for &offset in targets {
                         reader.seek(SeekFrom::Start(offset)).unwrap();
@@ -126,7 +129,9 @@ fn bench_repeated_seek(c: &mut Criterion) {
 
     group.bench_function("cached_500x_same_block", |b| {
         b.iter(|| {
-            let mut reader = PgzfReader::new(Cursor::new(&pgzf)).unwrap().with_block_cache(64);
+            let mut reader = PgzfReader::new(Cursor::new(&pgzf))
+                .unwrap()
+                .with_block_cache(64);
             let mut buf = vec![0u8; 1024];
             for _ in 0..num_seeks {
                 reader.seek(SeekFrom::Start(offset)).unwrap();
@@ -138,7 +143,9 @@ fn bench_repeated_seek(c: &mut Criterion) {
 
     group.bench_function("no_cache_500x_same_block", |b| {
         b.iter(|| {
-            let mut reader = PgzfReader::new(Cursor::new(&pgzf)).unwrap().with_block_cache(0);
+            let mut reader = PgzfReader::new(Cursor::new(&pgzf))
+                .unwrap()
+                .with_block_cache(0);
             let mut buf = vec![0u8; 1024];
             for _ in 0..num_seeks {
                 reader.seek(SeekFrom::Start(offset)).unwrap();
@@ -168,7 +175,9 @@ fn bench_sequential_read(c: &mut Criterion) {
 
     group.bench_function("cached", |b| {
         b.iter(|| {
-            let mut reader = PgzfReader::new(Cursor::new(&pgzf)).unwrap().with_block_cache(64);
+            let mut reader = PgzfReader::new(Cursor::new(&pgzf))
+                .unwrap()
+                .with_block_cache(64);
             let mut output = Vec::with_capacity(total);
             reader.read_to_end(&mut output).unwrap();
             output
@@ -177,7 +186,9 @@ fn bench_sequential_read(c: &mut Criterion) {
 
     group.bench_function("no_cache", |b| {
         b.iter(|| {
-            let mut reader = PgzfReader::new(Cursor::new(&pgzf)).unwrap().with_block_cache(0);
+            let mut reader = PgzfReader::new(Cursor::new(&pgzf))
+                .unwrap()
+                .with_block_cache(0);
             let mut output = Vec::with_capacity(total);
             reader.read_to_end(&mut output).unwrap();
             output
@@ -187,5 +198,10 @@ fn bench_sequential_read(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_random_seek, bench_repeated_seek, bench_sequential_read);
+criterion_group!(
+    benches,
+    bench_random_seek,
+    bench_repeated_seek,
+    bench_sequential_read
+);
 criterion_main!(benches);

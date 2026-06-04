@@ -178,9 +178,7 @@ impl<R: Read + Seek> PgzfReader<R> {
 
     /// Returns the total memory usage (cache + readahead + current block) in bytes.
     pub fn total_memory_usage(&self) -> usize {
-        self.block_cache.memory_usage()
-            + self.readahead_memory_usage()
-            + self.current_block.len()
+        self.block_cache.memory_usage() + self.readahead_memory_usage() + self.current_block.len()
     }
 
     pub fn seek_to_byte(&mut self, offset: u64) -> Result<()> {
@@ -422,7 +420,8 @@ impl<R: Read + Seek> PgzfReader<R> {
         let extra_start = GZIP_FIXED_HEADER_SIZE + 2;
         raw[extra_start..extra_start + xlen].copy_from_slice(&extra);
         let rest_start = extra_start + xlen;
-        self.inner.read_exact(&mut raw[rest_start..rest_start + remaining])?;
+        self.inner
+            .read_exact(&mut raw[rest_start..rest_start + remaining])?;
 
         Ok(Some(RawBlock {
             raw,
@@ -542,7 +541,13 @@ impl<R: Read + Seek> PgzfReader<R> {
                 .compressed_offset(last_end)
                 .unwrap_or_else(|| index.total_compressed());
 
-            (total_blocks, start, end, ranges_with_offsets, last_end_offset)
+            (
+                total_blocks,
+                start,
+                end,
+                ranges_with_offsets,
+                last_end_offset,
+            )
         };
         // `index` borrow is dropped here — safe to mutate self
 
@@ -605,7 +610,8 @@ impl<R: Read + Seek> PgzfReader<R> {
                     .map_init(
                         || ReusableDecompressor::new(),
                         |decompressor, (block_idx, raw, header_size)| {
-                            let data = Self::decompress_raw_block_with(decompressor, raw, *header_size)?;
+                            let data =
+                                Self::decompress_raw_block_with(decompressor, raw, *header_size)?;
                             Ok::<_, std::io::Error>((*block_idx, data))
                         },
                     )
@@ -620,7 +626,10 @@ impl<R: Read + Seek> PgzfReader<R> {
 
             // Restore file position for sequential continuation
             self.inner.seek(SeekFrom::Start(last_end_offset))?;
-            self.next_block_index = ranges_with_offsets.last().map(|(r, _)| r.end).unwrap_or(start);
+            self.next_block_index = ranges_with_offsets
+                .last()
+                .map(|(r, _)| r.end)
+                .unwrap_or(start);
 
             eof
         } else {
@@ -1151,7 +1160,8 @@ mod tests {
         let cursor = Cursor::new(pgzf_data);
 
         // Create reader with memory limit (512 bytes)
-        let mut reader = PgzfReader::new(cursor).unwrap()
+        let mut reader = PgzfReader::new(cursor)
+            .unwrap()
             .with_block_cache_memory_limit(100, 512);
 
         // Read all data

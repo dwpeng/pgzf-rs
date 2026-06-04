@@ -22,7 +22,9 @@ struct CacheEntry {
 impl BlockCache {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
-            entries: LruCache::new(std::num::NonZeroUsize::new(capacity.max(1)).unwrap_or(std::num::NonZeroUsize::MIN)),
+            entries: LruCache::new(
+                std::num::NonZeroUsize::new(capacity.max(1)).unwrap_or(std::num::NonZeroUsize::MIN),
+            ),
             capacity,
             max_memory_bytes: None,
             current_memory_bytes: 0,
@@ -41,7 +43,9 @@ impl BlockCache {
         if self.capacity == 0 {
             return None;
         }
-        self.entries.get(&block_index).map(|entry| Arc::clone(&entry.data))
+        self.entries
+            .get(&block_index)
+            .map(|entry| Arc::clone(&entry.data))
     }
 
     /// Insert decompressed `data` for `block_index`. Evicts the LRU entry if full.
@@ -103,8 +107,9 @@ impl BlockCache {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
+
+    use super::*;
 
     #[test]
     fn test_basic_insert_get() {

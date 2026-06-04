@@ -123,13 +123,15 @@ mod tests {
         let data1 = b"First test block";
         let compressed1 = compress_block(data1, 6).unwrap();
         let mut output1 = vec![0u8; 1024];
-        let size1 = decompress_block_reusable(&mut decompressor, &compressed1, &mut output1).unwrap();
+        let size1 =
+            decompress_block_reusable(&mut decompressor, &compressed1, &mut output1).unwrap();
         assert_eq!(&output1[..size1], data1);
 
         let data2 = b"Second test block";
         let compressed2 = compress_block(data2, 6).unwrap();
         let mut output2 = vec![0u8; 1024];
-        let size2 = decompress_block_reusable(&mut decompressor, &compressed2, &mut output2).unwrap();
+        let size2 =
+            decompress_block_reusable(&mut decompressor, &compressed2, &mut output2).unwrap();
         assert_eq!(&output2[..size2], data2);
     }
 }

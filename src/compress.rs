@@ -1,5 +1,6 @@
-use crate::error::{PgzfError, Result};
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress};
+
+use crate::error::{PgzfError, Result};
 
 /// Reusable compressor that avoids repeated allocation.
 /// The internal state is reset between uses via `reset()`, which is cheaper
