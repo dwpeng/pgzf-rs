@@ -1,0 +1,62 @@
+[package]
+name = "pgzf-fuzz"
+version = "0.0.0"
+authors = ["fuzz"]
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.pgzf]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_write_read_roundtrip"
+path = "fuzz_targets/fuzz_write_read_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_seek_operations"
+path = "fuzz_targets/fuzz_seek_operations.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_config_variations"
+path = "fuzz_targets/fuzz_config_variations.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_read_blocks"
+path = "fuzz_targets/fuzz_read_blocks.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_edge_cases"
+path = "fuzz_targets/fuzz_edge_cases.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_raw_block_read"
+path = "fuzz_targets/fuzz_raw_block_read.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_cache_behavior"
+path = "fuzz_targets/fuzz_cache_behavior.rs"
+test = false
+doc = false

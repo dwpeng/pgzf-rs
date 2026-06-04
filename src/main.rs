@@ -66,9 +66,12 @@ struct Cli {
 }
 
 fn init_rayon_pool(threads: usize) {
-    let _ = rayon::ThreadPoolBuilder::new()
+    if let Err(e) = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
-        .build_global();
+        .build_global()
+    {
+        eprintln!("warning: could not set thread count to {threads}: {e}");
+    }
 }
 
 fn gz_extension(path: &Path) -> PathBuf {

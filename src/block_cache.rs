@@ -1,28 +1,38 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
-struct CacheEntry {
-    data: Arc<[u8]>,
-    access_count: usize,
-}
+use lru::LruCache;
 
 /// LRU block cache for decompressed PGZF blocks.
 ///
 /// Caches decompressed block data indexed by block number. When the cache is
-/// full, the least-recently-used entry is evicted. Setting capacity to 0
-/// disables caching entirely.
+/// full (by count or memory), the least-recently-used entry is evicted.
+/// Setting capacity to 0 disables caching entirely.
 pub(crate) struct BlockCache {
-    entries: HashMap<usize, CacheEntry>,
+    entries: LruCache<usize, CacheEntry>,
     capacity: usize,
-    counter: usize,
+    max_memory_bytes: Option<usize>,
+    current_memory_bytes: usize,
+}
+
+struct CacheEntry {
+    data: Arc<[u8]>,
+    size: usize,
 }
 
 impl BlockCache {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
-            entries: HashMap::with_capacity(capacity.min(1024)),
+            entries: LruCache::new(std::num::NonZeroUsize::new(capacity.max(1)).unwrap_or(std::num::NonZeroUsize::MIN)),
             capacity,
-            counter: 0,
+            max_memory_bytes: None,
+            current_memory_bytes: 0,
         }
+    }
+
+    /// Set the maximum memory limit for the cache in bytes.
+    pub(crate) fn with_memory_limit(mut self, max_bytes: usize) -> Self {
+        self.max_memory_bytes = Some(max_bytes);
+        self
     }
 
     /// Retrieve cached data for `block_index`, updating access time on hit.
@@ -31,13 +41,7 @@ impl BlockCache {
         if self.capacity == 0 {
             return None;
         }
-        if let Some(entry) = self.entries.get_mut(&block_index) {
-            self.counter += 1;
-            entry.access_count = self.counter;
-            Some(Arc::clone(&entry.data))
-        } else {
-            None
-        }
+        self.entries.get(&block_index).map(|entry| Arc::clone(&entry.data))
     }
 
     /// Insert decompressed `data` for `block_index`. Evicts the LRU entry if full.
@@ -45,25 +49,36 @@ impl BlockCache {
         if self.capacity == 0 {
             return;
         }
-        // If updating an existing entry, just replace
-        if let Some(entry) = self.entries.get_mut(&block_index) {
-            self.counter += 1;
-            entry.access_count = self.counter;
-            entry.data = data;
-            return;
+
+        let size = data.len();
+
+        // Remove existing entry if updating
+        if let Some(old_entry) = self.entries.pop(&block_index) {
+            self.current_memory_bytes -= old_entry.size;
         }
-        // Evict LRU if at capacity
-        if self.entries.len() >= self.capacity {
-            self.evict_lru();
+
+        // Evict LRU entries to satisfy memory limit
+        if let Some(max_bytes) = self.max_memory_bytes {
+            while self.current_memory_bytes + size > max_bytes && !self.entries.is_empty() {
+                self.evict_one();
+            }
         }
-        self.counter += 1;
-        self.entries.insert(
-            block_index,
-            CacheEntry {
-                data,
-                access_count: self.counter,
-            },
-        );
+
+        // Evict LRU entries to satisfy capacity limit
+        while self.entries.len() >= self.capacity {
+            self.evict_one();
+        }
+
+        // Insert new entry
+        self.current_memory_bytes += size;
+        self.entries.put(block_index, CacheEntry { data, size });
+    }
+
+    /// Evict one LRU entry.
+    fn evict_one(&mut self) {
+        if let Some((_, entry)) = self.entries.pop_lru() {
+            self.current_memory_bytes -= entry.size;
+        }
     }
 
     pub(crate) fn capacity(&self) -> usize {
@@ -74,14 +89,15 @@ impl BlockCache {
         self.entries.len()
     }
 
-    fn evict_lru(&mut self) {
-        if let Some((&lru_key, _)) = self
-            .entries
-            .iter()
-            .min_by_key(|(_, entry)| entry.access_count)
-        {
-            self.entries.remove(&lru_key);
-        }
+    /// Returns the current memory usage in bytes.
+    pub(crate) fn memory_usage(&self) -> usize {
+        self.current_memory_bytes
+    }
+
+    /// Returns the maximum memory limit in bytes, if set.
+    #[allow(dead_code)]
+    pub(crate) fn memory_limit(&self) -> Option<usize> {
+        self.max_memory_bytes
     }
 }
 
@@ -145,5 +161,38 @@ mod tests {
         cache.insert(0, Arc::from(vec![99]));
         assert_eq!(cache.get(0).unwrap().as_ref(), &[99]);
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn test_memory_limit_eviction() {
+        let mut cache = BlockCache::new(100).with_memory_limit(1024);
+
+        // Insert 1KB data
+        cache.insert(0, Arc::from(vec![0u8; 1024]));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.memory_usage(), 1024);
+
+        // Insert another 1KB, should evict first entry
+        cache.insert(1, Arc::from(vec![0u8; 1024]));
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get(0).is_none());
+        assert!(cache.get(1).is_some());
+        assert_eq!(cache.memory_usage(), 1024);
+    }
+
+    #[test]
+    fn test_memory_tracking() {
+        let mut cache = BlockCache::new(10).with_memory_limit(10240);
+
+        cache.insert(0, Arc::from(vec![0u8; 100]));
+        cache.insert(1, Arc::from(vec![0u8; 200]));
+        assert_eq!(cache.memory_usage(), 300);
+
+        cache.insert(2, Arc::from(vec![0u8; 300]));
+        assert_eq!(cache.memory_usage(), 600);
+
+        // Update existing entry
+        cache.insert(0, Arc::from(vec![0u8; 50]));
+        assert_eq!(cache.memory_usage(), 550);
     }
 }

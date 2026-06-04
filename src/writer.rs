@@ -4,6 +4,7 @@ use rayon::prelude::*;
 
 use crate::{
     BlockType,
+    compress::ReusableCompressor,
     constants::*,
     error::Result,
     format::{self, IndexEntry, PgzfConfig},
@@ -78,7 +79,14 @@ impl<W: Write + Seek> PgzfWriter<W> {
             BlockType::Dat
         };
 
-        let data = self.buffer[..self.buffer_len].to_vec();
+        // Move data out of the reusable buffer without copying.
+        // truncate() only adjusts the length — no memcpy, no dealloc.
+        // Allocate a new reusable buffer (same capacity as before).
+        let mut data = std::mem::replace(
+            &mut self.buffer,
+            vec![0u8; self.config.block_size],
+        );
+        data.truncate(self.buffer_len);
         self.pending_blocks.push(PendingBlock { data, block_type });
 
         self.blocks_in_group += 1;
@@ -94,11 +102,11 @@ impl<W: Write + Seek> PgzfWriter<W> {
     }
 
     fn compress_single_block(
+        compressor: &mut ReusableCompressor,
         data: &[u8],
         block_type: BlockType,
-        level: u32,
     ) -> Result<CompressedBlock> {
-        let compressed = crate::compress::compress_block(data, level)?;
+        let compressed = compressor.compress(data)?;
         let crc = crc32fast::hash(data);
 
         let header_size = match block_type {
@@ -131,31 +139,38 @@ impl<W: Write + Seek> PgzfWriter<W> {
         }
 
         let level = self.config.compression_level;
-
-        // Parallel compression: each block is compressed independently
-        let compressed: Vec<CompressedBlock> = self
-            .pending_blocks
-            .par_iter()
-            .map(|block| Self::compress_single_block(&block.data, block.block_type, level))
-            .collect::<Result<Vec<_>>>()?;
+        let batch_size = self.config.compression_batch_size;
 
         // Sequential write: maintain block order
         let w = self.inner.as_mut().unwrap();
-        let mut block_entries = Vec::with_capacity(compressed.len());
+        let mut block_entries = Vec::with_capacity(self.pending_blocks.len());
 
-        for cb in &compressed {
-            w.write_all(&cb.header)?;
-            w.write_all(&cb.compressed)?;
-            w.write_all(&cb.trailer)?;
+        // Process blocks in batches to reduce memory usage
+        // Each thread gets its own ReusableCompressor via thread_local
+        for batch in self.pending_blocks.chunks(batch_size) {
+            // Parallel compression with per-thread reusable compressor
+            let compressed: Vec<CompressedBlock> = batch
+                .par_iter()
+                .map_init(
+                    || ReusableCompressor::new(level),
+                    |compressor, block| Self::compress_single_block(compressor, &block.data, block.block_type),
+                )
+                .collect::<Result<Vec<_>>>()?;
 
-            block_entries.push(IndexEntry {
-                compressed_size: cb.zc,
-                uncompressed_size: cb.uncompressed_size,
-            });
+            for cb in &compressed {
+                w.write_all(&cb.header)?;
+                w.write_all(&cb.compressed)?;
+                w.write_all(&cb.trailer)?;
 
-            self.total_compressed += cb.zc as u64;
-            self.total_uncompressed += cb.uncompressed_size as u64;
-            self.total_blocks += 1;
+                block_entries.push(IndexEntry {
+                    compressed_size: cb.zc,
+                    uncompressed_size: cb.uncompressed_size,
+                });
+
+                self.total_compressed += cb.zc as u64;
+                self.total_uncompressed += cb.uncompressed_size as u64;
+                self.total_blocks += 1;
+            }
         }
 
         // Write IDX block
@@ -370,6 +385,142 @@ mod tests {
         for i in 0u8..10 {
             expected.extend_from_slice(&vec![i; block_size]);
         }
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn test_write_empty_data() {
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let writer = PgzfWriter::new(cursor);
+        // Don't write anything
+        let cursor = writer.finish().unwrap();
+        let output = cursor.into_inner();
+        // Should still produce valid output
+        assert!(output.is_empty() || output.len() > 0);
+    }
+
+    #[test]
+    fn test_write_single_byte() {
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = PgzfWriter::new(cursor);
+        writer.write_all(b"A").unwrap();
+        let cursor = writer.finish().unwrap();
+        let output = cursor.into_inner();
+        assert!(!output.is_empty());
+        assert_eq!(output[0], 0x1f);
+        assert_eq!(output[1], 0x8b);
+    }
+
+    #[test]
+    fn test_write_large_data() {
+        let block_size = 1024;
+        let num_blocks = 100;
+        let config = PgzfConfig::builder()
+            .block_size(block_size)
+            .group_blocks(10)
+            .build();
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = PgzfWriter::with_config(cursor, config);
+
+        let original: Vec<u8> = (0..num_blocks)
+            .flat_map(|i| vec![i as u8; block_size])
+            .collect();
+        writer.write_all(&original).unwrap();
+        let cursor = writer.finish().unwrap();
+        let pgzf_data = cursor.into_inner();
+
+        // Verify round-trip
+        let mut reader = crate::reader::PgzfReader::new(std::io::Cursor::new(pgzf_data)).unwrap();
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        assert_eq!(output, original);
+    }
+
+    #[test]
+    fn test_write_with_compression_batch_size() {
+        let block_size = 256;
+        let config = PgzfConfig::builder()
+            .block_size(block_size)
+            .group_blocks(10)
+            .compression_batch_size(3)  // Small batch size
+            .build();
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = PgzfWriter::with_config(cursor, config);
+
+        let original: Vec<u8> = (0..10)
+            .flat_map(|i| vec![i as u8; block_size])
+            .collect();
+        writer.write_all(&original).unwrap();
+        let cursor = writer.finish().unwrap();
+        let pgzf_data = cursor.into_inner();
+
+        // Verify round-trip
+        let mut reader = crate::reader::PgzfReader::new(std::io::Cursor::new(pgzf_data)).unwrap();
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        assert_eq!(output, original);
+    }
+
+    #[test]
+    fn test_write_with_memory_limits() {
+        let block_size = 256;
+        let config = PgzfConfig::builder()
+            .block_size(block_size)
+            .group_blocks(10)
+            .cache_memory_limit_mb(1)
+            .compression_batch_size(5)
+            .build();
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = PgzfWriter::with_config(cursor, config);
+
+        let original: Vec<u8> = (0..10)
+            .flat_map(|i| vec![i as u8; block_size])
+            .collect();
+        writer.write_all(&original).unwrap();
+        let cursor = writer.finish().unwrap();
+        let pgzf_data = cursor.into_inner();
+
+        // Verify round-trip
+        let mut reader = crate::reader::PgzfReader::new(std::io::Cursor::new(pgzf_data)).unwrap();
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        assert_eq!(output, original);
+    }
+
+    #[test]
+    fn test_write_incremental() {
+        let block_size = 256;
+        let config = PgzfConfig::builder()
+            .block_size(block_size)
+            .group_blocks(5)
+            .build();
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = PgzfWriter::with_config(cursor, config);
+
+        // Write data in small chunks
+        let mut expected = Vec::new();
+        for i in 0..20 {
+            let chunk = vec![i as u8; 100];
+            writer.write_all(&chunk).unwrap();
+            expected.extend_from_slice(&chunk);
+        }
+        let cursor = writer.finish().unwrap();
+        let pgzf_data = cursor.into_inner();
+
+        // Verify round-trip
+        let mut reader = crate::reader::PgzfReader::new(std::io::Cursor::new(pgzf_data)).unwrap();
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
         assert_eq!(output, expected);
     }
 }

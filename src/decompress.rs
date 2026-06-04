@@ -2,6 +2,7 @@ use std::io::{Read, Seek};
 
 use crate::{
     BlockType,
+    compress::ReusableDecompressor,
     constants::*,
     error::{PgzfError, Result},
     format::{
@@ -9,14 +10,20 @@ use crate::{
     },
 };
 
-pub(crate) fn decompress_block(compressed: &[u8], output: &mut [u8]) -> Result<usize> {
-    use flate2::{Decompress, FlushDecompress};
+/// Decompress a block using a reusable decompressor (for batch use).
+#[allow(dead_code)]
+pub(crate) fn decompress_block_reusable(
+    decompressor: &mut ReusableDecompressor,
+    compressed: &[u8],
+    output: &mut [u8],
+) -> Result<usize> {
+    decompressor.decompress(compressed, output)
+}
 
-    let mut decompressor = Decompress::new(false);
-    decompressor
-        .decompress(compressed, output, FlushDecompress::Finish)
-        .map_err(|e| PgzfError::Inflate(e.to_string()))?;
-    Ok(decompressor.total_out() as usize)
+/// One-shot decompression (for callers that don't batch).
+pub(crate) fn decompress_block(compressed: &[u8], output: &mut [u8]) -> Result<usize> {
+    let mut decompressor = ReusableDecompressor::new();
+    decompressor.decompress(compressed, output)
 }
 
 pub(crate) fn read_pgzf_block<R: Read + Seek>(
@@ -107,5 +114,22 @@ mod tests {
         let mut output = vec![0u8; 1024];
         let size = decompress_block(&compressed, &mut output).unwrap();
         assert_eq!(&output[..size], data);
+    }
+
+    #[test]
+    fn test_decompress_block_reusable() {
+        let mut decompressor = ReusableDecompressor::new();
+
+        let data1 = b"First test block";
+        let compressed1 = compress_block(data1, 6).unwrap();
+        let mut output1 = vec![0u8; 1024];
+        let size1 = decompress_block_reusable(&mut decompressor, &compressed1, &mut output1).unwrap();
+        assert_eq!(&output1[..size1], data1);
+
+        let data2 = b"Second test block";
+        let compressed2 = compress_block(data2, 6).unwrap();
+        let mut output2 = vec![0u8; 1024];
+        let size2 = decompress_block_reusable(&mut decompressor, &compressed2, &mut output2).unwrap();
+        assert_eq!(&output2[..size2], data2);
     }
 }

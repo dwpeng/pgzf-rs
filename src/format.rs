@@ -210,6 +210,13 @@ pub struct PgzfConfig {
     pub block_size: usize,
     pub group_blocks: usize,
     pub compression_level: u32,
+    /// Maximum memory for block cache in bytes (None = unlimited, default: None)
+    pub cache_memory_limit_bytes: Option<usize>,
+    /// Maximum memory for readahead buffer in bytes (None = unlimited, default: None)
+    pub readahead_memory_limit_bytes: Option<usize>,
+    /// Number of blocks to compress in parallel per batch (default: 1000)
+    /// Lower values reduce memory usage but may increase compression time
+    pub compression_batch_size: usize,
 }
 
 impl Default for PgzfConfig {
@@ -218,6 +225,9 @@ impl Default for PgzfConfig {
             block_size: DEFAULT_BLOCK_SIZE,
             group_blocks: DEFAULT_GROUP_BLOCKS,
             compression_level: DEFAULT_COMPRESSION_LEVEL,
+            cache_memory_limit_bytes: None,
+            readahead_memory_limit_bytes: None,
+            compression_batch_size: 1000,
         }
     }
 }
@@ -251,6 +261,37 @@ impl PgzfConfigBuilder {
 
     pub fn compression_level(mut self, level: u32) -> Self {
         self.config.compression_level = level.clamp(1, 9);
+        self
+    }
+
+    /// Set maximum memory for block cache in megabytes.
+    pub fn cache_memory_limit_mb(mut self, mb: usize) -> Self {
+        self.config.cache_memory_limit_bytes = Some(mb * (1 << 20));
+        self
+    }
+
+    /// Set maximum memory for block cache in bytes.
+    pub fn cache_memory_limit_bytes(mut self, bytes: usize) -> Self {
+        self.config.cache_memory_limit_bytes = Some(bytes);
+        self
+    }
+
+    /// Set maximum memory for readahead buffer in megabytes.
+    pub fn readahead_memory_limit_mb(mut self, mb: usize) -> Self {
+        self.config.readahead_memory_limit_bytes = Some(mb * (1 << 20));
+        self
+    }
+
+    /// Set maximum memory for readahead buffer in bytes.
+    pub fn readahead_memory_limit_bytes(mut self, bytes: usize) -> Self {
+        self.config.readahead_memory_limit_bytes = Some(bytes);
+        self
+    }
+
+    /// Set the number of blocks to compress in parallel per batch.
+    /// Lower values reduce memory usage but may increase compression time.
+    pub fn compression_batch_size(mut self, size: usize) -> Self {
+        self.config.compression_batch_size = size.max(1);
         self
     }
 
@@ -370,5 +411,23 @@ mod tests {
         assert_eq!(config.block_size, 2 * 1024 * 1024);
         assert_eq!(config.group_blocks, 4000);
         assert_eq!(config.compression_level, 9);
+    }
+
+    #[test]
+    fn test_config_builder_memory_limits() {
+        let config = PgzfConfig::builder()
+            .block_size_mb(1)
+            .cache_memory_limit_mb(64)
+            .readahead_memory_limit_mb(16)
+            .build();
+        assert_eq!(config.cache_memory_limit_bytes, Some(64 * 1024 * 1024));
+        assert_eq!(config.readahead_memory_limit_bytes, Some(16 * 1024 * 1024));
+    }
+
+    #[test]
+    fn test_config_builder_default_memory_limits() {
+        let config = PgzfConfig::builder().build();
+        assert_eq!(config.cache_memory_limit_bytes, None);
+        assert_eq!(config.readahead_memory_limit_bytes, None);
     }
 }
